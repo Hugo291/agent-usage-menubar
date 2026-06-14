@@ -1,0 +1,18 @@
+# Build output
+ClaudeUsageWidget.app/
+*.app/
+
+# macOS cruft
+.DS_Store
+
+# Icon work-in-progress / scratch
+icon-candidates/
+AppIcon.iconset/
+_ic.html
+clawd-preview.png
+clawd-v1.png
+clawd-v2.png
+clawd.svg
+
+# Editor / misc
+*.swp
