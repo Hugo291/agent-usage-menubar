@@ -473,6 +473,15 @@ enum Ccusage {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = args
+        // ccusage est un script `#!/usr/bin/env node` : il lui faut `node` dans le PATH.
+        // Lancé via LaunchAgent/`open`, le widget hérite d'un PATH minimal (/usr/bin:/bin)
+        // sans Homebrew → `env node` échoue. On préfixe donc le PATH avec les dossiers
+        // bin habituels (et celui de ccusage lui-même, où node est généralement installé).
+        var env = ProcessInfo.processInfo.environment
+        let extra = [(bin as NSString).deletingLastPathComponent, "/opt/homebrew/bin", "/usr/local/bin"]
+            .joined(separator: ":")
+        env["PATH"] = extra + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        p.environment = env
         let out = Pipe()
         p.standardOutput = out
         p.standardError = Pipe()
