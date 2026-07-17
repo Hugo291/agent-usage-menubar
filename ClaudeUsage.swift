@@ -588,15 +588,15 @@ enum CodexLimits {
                   let payload = obj["payload"] as? [String: Any],
                   let rl = payload["rate_limits"] as? [String: Any] else { continue }
             var r = Reading(epoch: epoch)
-            if let w = rl["primary"] as? [String: Any],
-               let u = (w["used_percent"] as? NSNumber)?.doubleValue {
-                r.fiveHourUsed = u
-                r.fiveHourReset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
-            }
-            if let w = rl["secondary"] as? [String: Any],
-               let u = (w["used_percent"] as? NSNumber)?.doubleValue {
-                r.weeklyUsed = u
-                r.weeklyReset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            // On classe chaque fenêtre par sa DURÉE (`window_minutes`), pas par sa
+            // position : Codex est passé d'un duo (primary=5 h, secondary=hebdo) à une
+            // SEULE fenêtre hebdomadaire placée dans `primary` (secondary=null) en 2026.
+            for key in ["primary", "secondary"] {
+                guard let w = rl[key] as? [String: Any],
+                      let used = (w["used_percent"] as? NSNumber)?.doubleValue else { continue }
+                let mins = (w["window_minutes"] as? NSNumber)?.doubleValue
+                let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+                classify(used: used, windowMinutes: mins, reset: reset, into: &r)
             }
             r.plan = (rl["plan_type"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             out.append(r)
@@ -640,12 +640,26 @@ enum CodexLimits {
             return String(rest[..<end])
         }
         var r = Reading(epoch: epoch)
-        r.fiveHourUsed = hdr("X-Codex-Primary-Used-Percent").flatMap(Double.init)
-        r.fiveHourReset = hdr("X-Codex-Primary-Reset-At").flatMap(Double.init).map { Date(timeIntervalSince1970: $0) }
-        r.weeklyUsed = hdr("X-Codex-Secondary-Used-Percent").flatMap(Double.init)
-        r.weeklyReset = hdr("X-Codex-Secondary-Reset-At").flatMap(Double.init).map { Date(timeIntervalSince1970: $0) }
+        // Même principe que côté CLI : on classe par durée de fenêtre, pas par position.
+        for pfx in ["Primary", "Secondary"] {
+            guard let used = hdr("X-Codex-\(pfx)-Used-Percent").flatMap(Double.init) else { continue }
+            let mins = hdr("X-Codex-\(pfx)-Window-Minutes").flatMap(Double.init)
+            let reset = hdr("X-Codex-\(pfx)-Reset-At").flatMap(Double.init).map { Date(timeIntervalSince1970: $0) }
+            classify(used: used, windowMinutes: mins, reset: reset, into: &r)
+        }
         r.plan = hdr("X-Codex-Plan-Type")
         return r
+    }
+
+    /// Range une fenêtre (used_percent + window_minutes + reset) dans le bon créneau de
+    /// `r` selon sa DURÉE : < 1 jour → fenêtre courte (5 h), sinon → hebdo. Robuste au
+    /// passage de Codex à une fenêtre unique hebdomadaire.
+    private static func classify(used: Double, windowMinutes: Double?, reset: Date?, into r: inout Reading) {
+        if let m = windowMinutes, m > 0, m < 1440 {
+            r.fiveHourUsed = used; r.fiveHourReset = reset
+        } else {
+            r.weeklyUsed = used; r.weeklyReset = reset
+        }
     }
 
     // MARK: Agrégation
@@ -663,20 +677,19 @@ enum CodexLimits {
         for url in recentSessionFiles(8) { readings += cliReadings(url) }   // source CLI
         if let r = appReading() { readings.append(r) }                      // source app
 
-        // Pour chaque fenêtre / le plan : la lecture la PLUS FRAÎCHE qui la porte.
-        func freshest(_ has: (Reading) -> Bool) -> Reading? {
-            readings.filter(has).max { $0.epoch < $1.epoch }
-        }
         var snap = Snapshot()
-        if let r = freshest({ $0.fiveHourUsed != nil }) {
-            snap.fiveHour = Limit(utilization: r.fiveHourUsed!, resetsAt: r.fiveHourReset)
+        // La lecture la plus FRAÎCHE qui porte au moins une fenêtre reflète la structure
+        // ACTUELLE des quotas Codex. On ne montre QUE ses fenêtres : sinon un vieux relevé
+        // (d'avant que Codex ne supprime le 5 h, mi-2026) ferait réapparaître une fenêtre
+        // qui n'existe plus. Ça ignore aussi les events « crédits » à fenêtres nulles.
+        if let ref = readings
+            .filter({ $0.fiveHourUsed != nil || $0.weeklyUsed != nil })
+            .max(by: { $0.epoch < $1.epoch }) {
+            if let u = ref.fiveHourUsed { snap.fiveHour = Limit(utilization: u, resetsAt: ref.fiveHourReset) }
+            if let u = ref.weeklyUsed { snap.sevenDay = Limit(utilization: u, resetsAt: ref.weeklyReset) }
+            snap.asOf = Date(timeIntervalSince1970: ref.epoch)
         }
-        if let r = freshest({ $0.weeklyUsed != nil }) {
-            snap.sevenDay = Limit(utilization: r.weeklyUsed!, resetsAt: r.weeklyReset)
-        }
-        snap.plan = freshest({ $0.plan != nil })?.plan
-        snap.asOf = readings.filter { $0.fiveHourUsed != nil || $0.weeklyUsed != nil }
-            .map(\.epoch).max().map { Date(timeIntervalSince1970: $0) }
+        snap.plan = readings.filter { $0.plan != nil }.max(by: { $0.epoch < $1.epoch })?.plan
         return snap
     }
 }
@@ -1132,10 +1145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hasQuota = (u.codexFiveHour != nil || u.codexSevenDay != nil)
         let hasUsage = (u.codexTodayCost != nil || u.codexTodayTokens != nil)
 
-        // Fenêtres de quota (mêmes barres que Claude : nom + barre + % restant + reset).
+        // Fenêtres de quota (mêmes barres que Claude). On n'affiche QUE celles qui
+        // existent : depuis 2026 Codex n'a plus qu'une fenêtre hebdomadaire (plus de 5 h).
         if hasQuota {
-            for it in limitBlock(label: I18n.t("5h window", "Fenêtre 5 h"), limit: u.codexFiveHour) { items.append(it) }
-            for it in limitBlock(label: I18n.t("Weekly quota", "Quota hebdo"), limit: u.codexSevenDay) { items.append(it) }
+            if let f = u.codexFiveHour {
+                for it in limitBlock(label: I18n.t("5h window", "Fenêtre 5 h"), limit: f) { items.append(it) }
+            }
+            if let w = u.codexSevenDay {
+                for it in limitBlock(label: I18n.t("Weekly quota", "Quota hebdo"), limit: w) { items.append(it) }
+            }
             // Âge du relevé : la donnée Codex ne bouge que quand Codex tourne (le % et le
             // reset ci-dessus sont donc ceux du dernier appel Codex, pas du temps réel).
             if let asOf = u.codexAsOf {
@@ -1255,8 +1273,8 @@ func printUsage(_ u: Usage) {
     line("Hebdo Sonnet", u.sevenDaySonnet)
     line("Hebdo Opus  ", u.sevenDayOpus)
     print("— Codex" + (u.codexPlan.map { " (plan \($0))" } ?? "") + " —")
-    line("Codex 5 h   ", u.codexFiveHour)
-    line("Codex hebdo ", u.codexSevenDay)
+    if u.codexFiveHour != nil { line("Codex 5 h   ", u.codexFiveHour) }
+    if u.codexSevenDay != nil { line("Codex hebdo ", u.codexSevenDay) }
     if let asOf = u.codexAsOf { print("Codex relevé: \(UI.agoText(asOf))") }
     if let cc = u.codexTodayCost, let ct = u.codexTodayTokens {
         print("Codex (jour): \(UI.humanCost(cc, decimals: 2)) · \(UI.humanTokens(ct)) tokens")

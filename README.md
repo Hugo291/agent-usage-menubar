@@ -24,10 +24,10 @@ Click them for the full breakdown.
 │  Weekly quota ██░░░░░░░░ 20% left    │
 │  Today: $436 · 551 M tokens        │
 │ Codex (OpenAI · plus)              │
-│  5h window   ░░░░░░░░░░  0% left     │
-│   resets today at 18:12            │
-│  Weekly quota ██████░░░░ 57% left   │
+│  Weekly quota ████████░░ 78% left   │
+│   resets Mon 21 Jul                │
 │  last reading 2 min ago · …        │
+│  Today: $0.75 · 111 k tokens       │
 │ Language ▸ · Refresh · Quit        │
 └────────────────────────────────────┘
 ```
@@ -74,16 +74,15 @@ the background every ~10 min and, on menu open, only re-fetches when the data is
 5 minutes — otherwise it shows the cached value. A transient `429` is treated as harmless.
 
 ### Codex — read from local logs (no API)
-Codex has no usage API, so the 5-hour / weekly windows are read from two local sources, keeping
-the **freshest reading per window**:
+Codex has no usage API, so the quota is read from your local Codex logs. Since mid-2026 OpenAI
+moved Codex to a **single weekly window** (it used to be a 5-hour + weekly pair) — the widget
+classifies each window by its **duration**, so it always shows whatever windows currently exist.
 
-1. **CLI sessions** — `~/.codex/sessions/**/rollout-*.jsonl` (the `rate_limits` events);
-2. **The Codex app** — `~/.codex/logs_2.sqlite` (the `X-Codex-*-Used-Percent` response headers).
-
-Whether you use the terminal or the Codex app, it picks the most recent. Because this data is
-**passive** (it only updates when Codex makes a call), the widget shows the **age of the last
-reading** ("last reading X ago") so you know the figures are from your last Codex call, not
-real time.
+The reading comes from `~/.codex/sessions/**/rollout-*.jsonl` (the `rate_limits` events), and,
+on Codex versions that still log them, the `X-Codex-*` response headers in
+`~/.codex/logs_2.sqlite`. The freshest reading wins. Because this data is **passive** (it only
+updates when Codex makes a call), the widget shows the **age of the last reading** ("last
+reading X ago") so you know the figures are from your last Codex call, not real time.
 
 ### Cost & tokens
 `ccusage daily` (Claude) and `ccusage codex daily` (Codex) provide today's cost and token
