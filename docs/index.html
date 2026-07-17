@@ -198,9 +198,7 @@
     <p class="tagline" style="margin:0;font-size:17px">One command. It builds, installs and starts at login — nothing else to set up.</p>
     <div class="install">
       <pre><span class="c"># macOS 12+, needs Xcode Command Line Tools (xcode-select --install)</span>
-git clone https://github.com/Hugo291/agent-usage-menubar.git
-cd agent-usage-menubar
-./install.sh</pre>
+curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/install.sh | bash</pre>
       <ol>
         <li><b>Builds</b> the native app and installs it to <code>~/Applications</code>.</li>
         <li><b>Enables auto-start</b> at every login.</li>

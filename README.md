@@ -32,20 +32,25 @@ Click them for the full breakdown.
 
 ## Install
 
-One command builds it, installs it to `~/Applications`, enables auto-start at login,
-and launches it. Nothing else to set up.
+One line downloads it, builds it, installs it to `~/Applications`, enables auto-start
+at login, and launches it. Nothing to clone, nothing else to set up.
 
 ```bash
 # macOS 12+, needs the Xcode Command Line Tools:  xcode-select --install
+curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/install.sh | bash
+```
+
+Prefer to see the code first? Clone it and run the same script:
+
+```bash
 git clone https://github.com/Hugo291/agent-usage-menubar.git
-cd agent-usage-menubar
-./install.sh
+cd agent-usage-menubar && ./install.sh
 ```
 
 Uninstall any time (stops it, disables auto-start, removes the app):
 
 ```bash
-./install.sh uninstall
+curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/install.sh | bash -s uninstall
 ```
 
 > **Optional:** install [`ccusage`](https://github.com/ryoppippi/ccusage)

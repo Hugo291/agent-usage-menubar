@@ -2,26 +2,32 @@
 #
 #  install.sh — Claude + Codex usage widget for the macOS menu bar
 #  ---------------------------------------------------------------
-#  One command does everything: build, install, enable auto-start at login,
-#  and launch. Nothing else to set up.
+#  One command does everything: download (if needed), build, install, enable
+#  auto-start at login, and launch. Nothing else to set up.
 #
+#  One-line install (nothing to clone):
+#      curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/install.sh | bash
+#
+#  From a checkout:
 #      ./install.sh             build + install + auto-start + launch
 #      ./install.sh uninstall   stop, disable auto-start, and remove it
 #
-#  Requirements: macOS 12+ and the Xcode Command Line Tools (for `swiftc`).
-#  `ccusage` is optional — only the daily $ cost / token figures need it; the
-#  5h / weekly quota percentages work without it.
+#  Requirements: macOS 12+ and the Xcode Command Line Tools (for `swiftc`, and
+#  `git` when installing via the one-liner). `ccusage` is optional — only the
+#  daily $ cost / token figures need it; the quota percentages work without it.
 #
 set -euo pipefail
 
 # ----------------------------------------------------------------- config ----
 APP_NAME="ClaudeUsageWidget"
 BUNDLE_ID="com.hugo.claudeusagewidget"        # must match the cache dir used in the code
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="https://github.com/Hugo291/agent-usage-menubar.git"
+SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
 INSTALL_DIR="$HOME/Applications"
 APP="$INSTALL_DIR/$APP_NAME.app"
 AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 UID_NUM="$(id -u)"
+CLONED=""
 
 # ----------------------------------------------------------------- output ----
 say()  { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
@@ -52,6 +58,18 @@ if ! command -v ccusage >/dev/null 2>&1 \
    && [ ! -x /opt/homebrew/bin/ccusage ] && [ ! -x /usr/local/bin/ccusage ]; then
   warn "ccusage not found — quota percentages will still work, but the daily cost / token figures will be hidden."
   warn "To enable them later:  npm install -g ccusage   (or:  bun install -g ccusage)"
+fi
+
+# --------------------------------------------------------- source bootstrap ---
+# Run standalone (e.g. `curl … | bash`, so the source isn't next to us)?
+# Fetch it into a temp dir and build from there; clean it up at the end.
+if [ -z "${SRC_DIR:-}" ] || [ ! -f "$SRC_DIR/ClaudeUsage.swift" ]; then
+  command -v git >/dev/null 2>&1 \
+    || die "git not found — needed to download the source. Install the Xcode Command Line Tools:  xcode-select --install"
+  say "Downloading the widget source…"
+  CLONED="$(mktemp -d)"
+  git clone --depth 1 "$REPO" "$CLONED" >/dev/null 2>&1 || die "Couldn't download from $REPO"
+  SRC_DIR="$CLONED"
 fi
 
 # ------------------------------------------------------------------- build ---
@@ -114,7 +132,8 @@ ok "It will start automatically at every login."
 
 # ------------------------------------------------------------------ launch ---
 open "$APP" 2>/dev/null || true
+[ -n "$CLONED" ] && rm -rf "$CLONED" 2>/dev/null || true   # tidy the temp checkout
 echo
 ok "Done. Look for the ⌛ / 🗓 icons in your menu bar (top-right)."
 echo "  Click them for the detail: Claude + Codex quotas, daily cost and projection."
-echo "  Uninstall anytime:  ./install.sh uninstall"
+echo "  Uninstall:  curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/install.sh | bash -s uninstall"
