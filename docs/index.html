@@ -80,6 +80,13 @@
   .macmenu .act.sel{background:#0a66ff;color:#fff}
   .e{color:rgba(0,0,0,.20)}
   .g{color:#15a049} .o{color:#df8409} .r{color:#df2f27}
+  .macmenu .ph{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;padding:8px 12px 3px}
+  .macmenu .ph .cost{font-weight:400;font-size:11.5px;color:#8c877f}
+  .macmenu .qr{display:flex;align-items:center;gap:7px;padding:2px 12px;font-size:12.5px}
+  .macmenu .qr .ql{color:#8c877f;font-size:11px;width:30px}
+  .macmenu .track{margin-left:auto;width:118px;height:6px;border-radius:3px;background:rgba(0,0,0,.13);overflow:hidden;flex:none}
+  .macmenu .track>span{display:block;height:100%;border-radius:3px}
+  .macmenu .rst{color:#9c978f;font-size:11px;padding:0 12px 2px 34px}
 
   .langtoggle{display:flex;justify-content:center;margin:18px 0 0}
   .langtoggle button{
@@ -139,31 +146,22 @@
         <div class="macmenu">
           <div class="h" data-en="Usage — Claude + Codex" data-fr="Usage — Claude + Codex"></div>
           <div class="div"></div>
-          <div class="big" data-en="Today total ≈ $437.02" data-fr="Total aujourd’hui ≈ $437.02"></div>
-          <div class="sub" data-en="Projected day ≈ $2898  (at current rate)" data-fr="Projection journée ≈ $2898  (au rythme actuel)"></div>
+
+          <div class="ph"><span>Claude · max</span><span class="cost">$436</span></div>
+          <div class="qr">⌛<span class="ql">5h</span><span class="track"><span style="width:70%;background:#15a049"></span></span><span class="pct g">70%</span></div>
+          <div class="rst" data-en="resets today at 05:37 · in 2 h" data-fr="reset aujourd’hui à 05:37 · dans 2 h"></div>
+          <div class="qr">🗓<span class="ql" data-en="week" data-fr="hebdo"></span><span class="track"><span style="width:20%;background:#df8409"></span></span><span class="pct o">20%</span></div>
+          <div class="rst" data-en="resets tomorrow at 15:37 · in 35 h" data-fr="reset demain à 15:37 · dans 35 h"></div>
           <div class="div"></div>
 
-          <div class="s">Claude (Anthropic · max)</div>
-          <div class="row"><b data-en="5h window" data-fr="Fenêtre 5 h"></b>
-            <span class="bar"><span class="g">██████</span><span class="e">░░░░</span></span>
-            <span class="pct g" data-en="70% left" data-fr="70% restant"></span></div>
-          <div class="sub" data-en="resets today at 05:37" data-fr="reset aujourd’hui à 05:37"></div>
-          <div class="row"><b data-en="Weekly quota" data-fr="Quota hebdo"></b>
-            <span class="bar"><span class="o">██</span><span class="e">░░░░░░░░</span></span>
-            <span class="pct o" data-en="20% left" data-fr="20% restant"></span></div>
-          <div class="sub" data-en="resets tomorrow at 15:37" data-fr="reset demain à 15:37"></div>
-          <div class="row dim" data-en="Today: $436 · 551 M tokens" data-fr="Aujourd’hui : $436 · 551 M tokens"></div>
+          <div class="ph"><span>Codex · plus</span><span class="cost">$0.75</span></div>
+          <div class="qr">🗓<span class="ql" data-en="week" data-fr="hebdo"></span><span class="track"><span style="width:78%;background:#15a049"></span></span><span class="pct g">78%</span></div>
+          <div class="rst" data-en="resets Mon 21 Jul · in 74 h" data-fr="reset lun. 21 juil. · dans 74 h"></div>
+          <div class="foot" data-en="last reading 2 min ago" data-fr="dernier relevé il y a 2 min"></div>
           <div class="div"></div>
 
-          <div class="s">Codex (OpenAI · plus)</div>
-          <div class="row"><b data-en="Weekly quota" data-fr="Quota hebdo"></b>
-            <span class="bar"><span class="g">████████</span><span class="e">░░</span></span>
-            <span class="pct g" data-en="78% left" data-fr="78% restant"></span></div>
-          <div class="sub" data-en="resets Mon 21 Jul at 00:34" data-fr="reset lun. 21 juil. à 00:34"></div>
-          <div class="foot" data-en="last reading 2 min ago · updates when you use Codex" data-fr="dernier relevé il y a 2 min · MAJ quand tu utilises Codex"></div>
-          <div class="row dim" data-en="Today: $0.75 · 111 k tokens" data-fr="Aujourd’hui : $0.75 · 111 k tokens"></div>
+          <div class="foot" data-en="Today $437 · ~$768 projected" data-fr="Aujourd’hui $437 · ~$768 projeté"></div>
           <div class="div"></div>
-
           <div class="foot" data-en="Updated just now" data-fr="Mis à jour à l’instant"></div>
           <div class="act"><span data-en="Language" data-fr="Langue"></span><span class="chev">›</span></div>
           <div class="act sel"><span data-en="Refresh" data-fr="Rafraîchir"></span></div>

@@ -984,51 +984,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func sectionTitle(_ text: String) -> NSMenuItem {
-        let attr = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ])
-        return displayItem(attr, indent: 14)
+    // MARK: Design « compact rows » (A)
+
+    /// Barre de progression fine et arrondie, dessinée en image (portion pleine = ce
+    /// qu'il RESTE), teintée `color`. Rasterisée à chaque reconstruction du menu.
+    private func barImage(remaining: Double, color: NSColor, width: CGFloat = 150, height: CGFloat = 6) -> NSImage {
+        let img = NSImage(size: NSSize(width: width, height: height))
+        img.lockFocus()
+        let rad = height / 2
+        NSColor.tertiaryLabelColor.withAlphaComponent(0.28).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: width, height: height), xRadius: rad, yRadius: rad).fill()
+        let w = CGFloat(max(0, min(100, remaining)) / 100.0) * width
+        if w > 0.5 {
+            color.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: max(height, w), height: height), xRadius: rad, yRadius: rad).fill()
+        }
+        img.unlockFocus()
+        return img
     }
 
-    /// Bloc d'une fenêtre de quota. Tout sur UNE ligne : nom + barre + « X% restant »
-    /// (barre et pourcentage teintés selon la marge), puis l'heure de reset en dessous.
-    private func limitBlock(label: String, limit: Limit?) -> [NSMenuItem] {
-        let labelAttr: [NSAttributedString.Key: Any] = [
+    private func barAttachment(remaining: Double, color: NSColor, width: CGFloat = 150) -> NSAttributedString {
+        let att = NSTextAttachment()
+        att.image = barImage(remaining: remaining, color: color, width: width, height: 6)
+        att.bounds = CGRect(x: 0, y: 1, width: width, height: 6)
+        return NSAttributedString(attachment: att)
+    }
+
+    /// Petite icône SF Symbol (teinte secondaire), en pièce jointe de texte.
+    private func rowIcon(_ name: String) -> NSAttributedString {
+        let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(cfg) else { return NSAttributedString(string: "") }
+        let att = NSTextAttachment(); att.image = img
+        att.bounds = CGRect(x: 0, y: -2, width: img.size.width, height: img.size.height)
+        return NSAttributedString(attachment: att)
+    }
+
+    /// En-tête d'un fournisseur : nom (gras) à gauche, coût du jour (discret) à droite.
+    private func providerHeader(_ name: String, cost: Double?) -> NSMenuItem {
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
+        let s = NSMutableAttributedString(string: name, attributes: [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ]
-        guard let l = limit else {
-            let line = NSMutableAttributedString(string: label, attributes: labelAttr)
-            line.append(NSAttributedString(string: "   " + I18n.t("unlimited", "non plafonné"), attributes: [
-                .font: NSFont.systemFont(ofSize: 12),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
-            return [displayItem(line, indent: 14)]
+            .foregroundColor: NSColor.labelColor, .paragraphStyle: para])
+        if let c = cost {
+            s.append(NSAttributedString(string: "\t" + UI.humanCost(c, decimals: 2), attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: para]))
         }
-        let (filled, empty) = UI.bar(remaining: l.remaining)
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let color = UI.color(forRemaining: l.remaining)
-        let line = NSMutableAttributedString(string: label, attributes: labelAttr)
-        line.append(NSAttributedString(string: "  ", attributes: [.font: mono]))
-        line.append(NSAttributedString(string: String(repeating: "█", count: filled), attributes: [
-            .font: mono, .foregroundColor: color,
-        ]))
-        line.append(NSAttributedString(string: String(repeating: "░", count: empty), attributes: [
-            .font: mono, .foregroundColor: NSColor.tertiaryLabelColor,
-        ]))
-        line.append(NSAttributedString(string: "  " + I18n.t(String(format: "%.0f%% left", l.remaining), String(format: "%.0f%% restant", l.remaining)), attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: color,
-        ]))
-        return [
-            displayItem(line, indent: 14),
-            displayItem(NSAttributedString(string: UI.resetText(l.resetsAt), attributes: [
+        return displayItem(s, indent: 16)
+    }
+
+    /// Une fenêtre de quota : ligne compacte (icône + libellé · barre fine · « X% »),
+    /// puis, en dessous, l'heure de reset (jour + heure + temps relatif). Colonnes
+    /// alignées par tabulations.
+    private func compactQuota(symbol: String, label: String, limit: Limit?) -> [NSMenuItem] {
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .left, location: 60),
+                         NSTextTab(textAlignment: .right, location: 244)]
+        let s = NSMutableAttributedString(attributedString: rowIcon(symbol))
+        s.append(NSAttributedString(string: " " + label, attributes: [
+            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+        if let l = limit {
+            let color = UI.color(forRemaining: l.remaining)
+            s.append(NSAttributedString(string: "\t"))
+            s.append(barAttachment(remaining: l.remaining, color: color))
+            s.append(NSAttributedString(string: "\t" + String(format: "%.0f%%", l.remaining), attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color]))
+        } else {
+            s.append(NSAttributedString(string: "\t" + I18n.t("unlimited", "non plafonné"), attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        s.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: s.length))
+
+        var out = [displayItem(s, indent: 16)]
+        if let l = limit, l.resetsAt != nil {
+            out.append(displayItem(NSAttributedString(string: UI.resetText(l.resetsAt), attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])),
-        ]
+                .foregroundColor: NSColor.tertiaryLabelColor]), indent: 40))
+        }
+        return out
     }
 
     private func headerItem() -> NSMenuItem {
@@ -1087,105 +1123,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { rebuildMenu(loadingMessage: I18n.t("Loading…", "Chargement…")) }
     }
 
-    /// Résumé en tête de menu : coût total du jour (Claude + Codex) + projection de fin
-    /// de journée. Le détail par fournisseur est ensuite dans chaque section.
+    /// Pied de menu : coût total du jour (Claude + Codex) + projection, sur une ligne.
     private func costItems(total: Double) -> [NSMenuItem] {
         let proj = UI.projectedCost(spentSoFar: total)
-        return [
-            displayItem(NSAttributedString(
-                string: I18n.t("Today total ≈ \(UI.humanCost(total, decimals: 2))", "Total aujourd’hui ≈ \(UI.humanCost(total, decimals: 2))"),
-                attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-                             .foregroundColor: NSColor.labelColor]), indent: 14),
-            displayItem(NSAttributedString(
-                string: I18n.t("Projected day ≈ \(UI.humanCost(proj, decimals: 0))  (at current rate)", "Projection journée ≈ \(UI.humanCost(proj, decimals: 0))  (au rythme actuel)"),
-                attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                             .foregroundColor: NSColor.secondaryLabelColor]), indent: 14),
-        ]
+        let txt = I18n.t("Today \(UI.humanCost(total)) · ~\(UI.humanCost(proj)) projected",
+                         "Aujourd’hui \(UI.humanCost(total)) · ~\(UI.humanCost(proj)) projeté")
+        return [displayItem(NSAttributedString(string: txt, attributes: [
+            .font: NSFont.systemFont(ofSize: 11),
+            .foregroundColor: NSColor.secondaryLabelColor]), indent: 16)]
     }
 
-    /// Section Claude (Anthropic) — MÊME disposition que Codex : en-tête avec plan,
-    /// fenêtres de quota 5 h + hebdo, détail par modèle si présent, puis conso du jour.
+    /// Section Claude : en-tête (plan + coût du jour), puis fenêtres 5 h et hebdo.
     private func claudeItems(_ u: Usage) -> [NSMenuItem] {
-        let title = u.claudePlan.map { "Claude (Anthropic · \($0))" } ?? "Claude (Anthropic)"
-        var items: [NSMenuItem] = [sectionTitle(title)]
-
-        for it in limitBlock(label: I18n.t("5h window", "Fenêtre 5 h"), limit: u.fiveHour) { items.append(it) }
-        for it in limitBlock(label: I18n.t("Weekly quota", "Quota hebdo"), limit: u.sevenDay) { items.append(it) }
-
-        // Détail hebdo par modèle (Sonnet / Opus), si présent.
-        if let s = u.sevenDaySonnet {
-            items.append(displayItem(NSAttributedString(
-                string: I18n.t(String(format: "Weekly Sonnet: %.0f%% left", s.remaining), String(format: "Hebdo Sonnet : %.0f%% restant", s.remaining)),
-                attributes: [.font: NSFont.systemFont(ofSize: 11),
-                             .foregroundColor: NSColor.secondaryLabelColor]), indent: 14))
-        }
-        if let o = u.sevenDayOpus {
-            items.append(displayItem(NSAttributedString(
-                string: I18n.t(String(format: "Weekly Opus: %.0f%% left", o.remaining), String(format: "Hebdo Opus : %.0f%% restant", o.remaining)),
-                attributes: [.font: NSFont.systemFont(ofSize: 11),
-                             .foregroundColor: NSColor.secondaryLabelColor]), indent: 14))
-        }
-
-        // Conso (coût + tokens) du jour.
-        if let cost = u.todayCost, let tokens = u.todayTokens {
-            items.append(displayItem(NSAttributedString(
-                string: I18n.t("Today: \(UI.humanCost(cost, decimals: 2)) · \(UI.humanTokens(tokens)) tokens", "Aujourd’hui : \(UI.humanCost(cost, decimals: 2)) · \(UI.humanTokens(tokens)) tokens"),
-                attributes: [.font: NSFont.systemFont(ofSize: 12),
-                             .foregroundColor: NSColor.labelColor]), indent: 14))
-        }
+        let name = u.claudePlan.map { "Claude · \($0)" } ?? "Claude"
+        var items = [providerHeader(name, cost: u.todayCost)]
+        items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: u.fiveHour)
+        items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: u.sevenDay)
         return items
     }
 
-    /// Section Codex (OpenAI) : fenêtres de quota 5 h + hebdo (mêmes barres que Claude),
-    /// puis conso du jour d'après `ccusage codex`.
+    /// Section Codex : en-tête (plan + coût), puis les fenêtres qui existent (depuis 2026
+    /// une seule hebdo) + l'âge du relevé (donnée passive : elle bouge quand Codex tourne).
     private func codexItems(_ u: Usage) -> [NSMenuItem] {
-        let title = u.codexPlan.map { "Codex (OpenAI · \($0))" } ?? "Codex (OpenAI)"
-        var items: [NSMenuItem] = [sectionTitle(title)]
-
+        let name = u.codexPlan.map { "Codex · \($0)" } ?? "Codex"
+        var items: [NSMenuItem] = [providerHeader(name, cost: u.codexTodayCost)]
         let hasQuota = (u.codexFiveHour != nil || u.codexSevenDay != nil)
-        let hasUsage = (u.codexTodayCost != nil || u.codexTodayTokens != nil)
-
-        // Fenêtres de quota (mêmes barres que Claude). On n'affiche QUE celles qui
-        // existent : depuis 2026 Codex n'a plus qu'une fenêtre hebdomadaire (plus de 5 h).
-        if hasQuota {
-            if let f = u.codexFiveHour {
-                for it in limitBlock(label: I18n.t("5h window", "Fenêtre 5 h"), limit: f) { items.append(it) }
-            }
-            if let w = u.codexSevenDay {
-                for it in limitBlock(label: I18n.t("Weekly quota", "Quota hebdo"), limit: w) { items.append(it) }
-            }
-            // Âge du relevé : la donnée Codex ne bouge que quand Codex tourne (le % et le
-            // reset ci-dessus sont donc ceux du dernier appel Codex, pas du temps réel).
-            if let asOf = u.codexAsOf {
-                items.append(displayItem(NSAttributedString(
-                    string: I18n.t("last reading \(UI.agoText(asOf)) · updates when you use Codex", "dernier relevé \(UI.agoText(asOf)) · MAJ quand tu utilises Codex"),
-                    attributes: [.font: NSFont.systemFont(ofSize: 10),
-                                 .foregroundColor: NSColor.tertiaryLabelColor]), indent: 14))
-            }
+        if let f = u.codexFiveHour {
+            items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: f)
         }
-
-        // Conso (coût + tokens) du jour et sur 30 j.
-        if hasUsage {
-            let cost = u.codexTodayCost ?? 0, tokens = u.codexTodayTokens ?? 0
-            if cost > 0 || tokens > 0 {
-                items.append(displayItem(NSAttributedString(
-                    string: I18n.t("Today: \(UI.humanCost(cost, decimals: 2)) · \(UI.humanTokens(tokens)) tokens", "Aujourd’hui : \(UI.humanCost(cost, decimals: 2)) · \(UI.humanTokens(tokens)) tokens"),
-                    attributes: [.font: NSFont.systemFont(ofSize: 12),
-                                 .foregroundColor: NSColor.labelColor]), indent: 14))
-            } else {
-                items.append(displayItem(NSAttributedString(
-                    string: I18n.t("no usage today", "aucun usage aujourd’hui"),
-                    attributes: [.font: NSFont.systemFont(ofSize: 11),
-                                 .foregroundColor: NSColor.secondaryLabelColor]), indent: 14))
-            }
+        if let w = u.codexSevenDay {
+            items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: w)
         }
-
-        // Ni quota, ni conso : Codex non détecté / illisible.
-        if !hasQuota && !hasUsage {
+        if hasQuota, let asOf = u.codexAsOf {
+            items.append(displayItem(NSAttributedString(
+                string: I18n.t("last reading \(UI.agoText(asOf))", "dernier relevé \(UI.agoText(asOf))"),
+                attributes: [.font: NSFont.systemFont(ofSize: 10),
+                             .foregroundColor: NSColor.tertiaryLabelColor]), indent: 16))
+        }
+        if !hasQuota && u.codexTodayCost == nil {
             items.append(displayItem(NSAttributedString(
                 string: I18n.t("Codex data unavailable", "données Codex indisponibles"),
                 attributes: [.font: NSFont.systemFont(ofSize: 11),
-                             .foregroundColor: NSColor.tertiaryLabelColor]), indent: 14))
+                             .foregroundColor: NSColor.tertiaryLabelColor]), indent: 16))
         }
         return items
     }
@@ -1217,20 +1196,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ])))
             }
         } else if let u = usage {
-            // Résumé : coût total du jour (Claude + Codex) + projection.
-            if let total = u.totalTodayCost {
-                for item in costItems(total: total) { menu.addItem(item) }
-                menu.addItem(.separator())
-            }
-            // Deux sections SYMÉTRIQUES : Claude puis Codex (même disposition).
+            // Deux sections compactes : Claude puis Codex.
             for item in claudeItems(u) { menu.addItem(item) }
             menu.addItem(.separator())
             for item in codexItems(u) { menu.addItem(item) }
+            // Pied : coût total du jour (Claude + Codex) + projection.
+            if let total = u.totalTodayCost {
+                menu.addItem(.separator())
+                for item in costItems(total: total) { menu.addItem(item) }
+            }
             // Incident transitoire (ex. 429) : on signale sans masquer les chiffres.
             if let notice = noticeMessage {
                 menu.addItem(displayItem(NSAttributedString(string: notice, attributes: [
                     .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: NSColor.systemOrange]), indent: 14))
+                    .foregroundColor: NSColor.systemOrange]), indent: 16))
             }
         }
 

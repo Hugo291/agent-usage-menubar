@@ -16,18 +16,16 @@ Click them for the full breakdown.
   ⌛70%  🗓20%  $437            ← menu bar (combined cost = Claude + Codex)
 ┌────────────────────────────────────┐
 │ Usage — Claude + Codex             │
-│ Today total ≈ $437.02              │
-│ Projected day ≈ $2898 (at current… │
-│ Claude (Anthropic · max)           │
-│  5h window   ██████░░░░  70% left   │
-│   resets today at 05:37            │
-│  Weekly quota ██░░░░░░░░ 20% left    │
-│  Today: $436 · 551 M tokens        │
-│ Codex (OpenAI · plus)              │
-│  Weekly quota ████████░░ 78% left   │
-│   resets Mon 21 Jul                │
-│  last reading 2 min ago · …        │
-│  Today: $0.75 · 111 k tokens       │
+│ Claude · max                 $436  │
+│  ⌛ 5h    ▬▬▬▬▬▬▭▭▭▭   70%          │
+│    resets today at 05:37 · in 2 h  │
+│  🗓 week  ▬▬▭▭▭▭▭▭▭▭   20%          │
+│    resets tomorrow at 15:37        │
+│ Codex · plus                 $0.75 │
+│  🗓 week  ▬▬▬▬▬▬▬▭▭▭   78%          │
+│    resets Mon 21 Jul · in 74 h     │
+│  last reading 2 min ago            │
+│ Today $437 · ~$768 projected       │
 │ Language ▸ · Refresh · Quit        │
 └────────────────────────────────────┘
 ```
