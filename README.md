@@ -94,7 +94,9 @@ cost is the **equivalent API price** — `input × in-price + output × out-pric
 write-price + cache-read × read-price`, summed per model. It's what the usage *would* cost
 pay-as-you-go, **not** what a subscription actually bills. **Hover the Claude cost** in the menu
 for a per-token-type split ($ on cache read / cache write / output / input) — usually a reminder
-that cache, not output, drives the number. Note the **Claude cost reflects Claude Code (CLI)
+that cache, not output, drives the number. Prefer it always visible? Toggle **Show cost by token
+type** in the menu to pin that breakdown as its own rows under the Claude cost. Note the
+**Claude cost reflects Claude Code (CLI)
 usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here (the
 **quota %**, being server-side, still covers everything).
 

@@ -53,6 +53,20 @@ enum BarPref {
     }
 }
 
+/// Option : afficher en permanence la ventilation du coût Claude PAR TYPE de token
+/// (cache read / cache write / output / input) directement dans le menu, plutôt que
+/// seulement au survol du coût. Persisté dans `UserDefaults` (défaut : masqué).
+enum TokenBreakdownPref {
+    private static let key = "widgetShowTokenBreakdown"
+    private(set) static var enabled: Bool = UserDefaults.standard.bool(forKey: key)
+
+    static func set(_ on: Bool) {
+        enabled = on
+        UserDefaults.standard.set(on, forKey: key)
+    }
+    static func toggle() { set(!enabled) }
+}
+
 // MARK: - Modèle
 
 /// Une limite renvoyée par l'API : `utilization` est un pourcentage 0–100 de
@@ -1100,7 +1114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// dollars. Les ratios de prix Anthropic (output 5×, cache-write 1,25×, cache-read
     /// 0,1× l'input) sont IDENTIQUES pour tous les modèles → on peut répartir le coût
     /// total connu par type sans coder de prix en dur ni connaître le mix de modèles.
-    private func costTooltip(_ u: Usage) -> String? {
+    private func costBreakdown(_ u: Usage) -> [(label: String, dollars: Double, tokens: Double)]? {
         guard let i = u.todayInput, let o = u.todayOutput,
               let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
               let total = u.todayCost, total > 0 else { return nil }
@@ -1112,10 +1126,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         let W = rows.reduce(0.0) { $0 + $1.weight }
         guard W > 0 else { return nil }
+        return rows.sorted { $0.weight > $1.weight }.map {
+            (label: $0.label, dollars: total * $0.weight / W, tokens: $0.tokens)
+        }
+    }
+
+    /// Même ventilation, en texte multi-ligne pour l'infobulle du coût.
+    private func costTooltip(_ u: Usage) -> String? {
+        guard let rows = costBreakdown(u), let total = u.todayCost else { return nil }
         let head = I18n.t("Claude cost today — \(UI.humanCost(total, decimals: 2)) (est. by token type):",
                           "Coût Claude du jour — \(UI.humanCost(total, decimals: 2)) (est. par type) :")
-        return rows.sorted { $0.weight > $1.weight }.reduce(head) { acc, r in
-            acc + "\n  \(UI.humanCost(total * r.weight / W, decimals: 2))  \(r.label)  (\(UI.humanTokens(r.tokens)))"
+        return rows.reduce(head) { acc, r in
+            acc + "\n  \(UI.humanCost(r.dollars, decimals: 2))  \(r.label)  (\(UI.humanTokens(r.tokens)))"
+        }
+    }
+
+    /// Même ventilation, en lignes de menu (option « toujours afficher ») : libellé +
+    /// nombre de tokens à gauche, dollars alignés à droite, nichée sous l'en-tête coût.
+    private func tokenBreakdownItems(_ u: Usage) -> [NSMenuItem] {
+        guard let rows = costBreakdown(u) else { return [] }
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
+        return rows.map { r in
+            let s = NSMutableAttributedString(string: r.label, attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para])
+            s.append(NSAttributedString(string: "  (\(UI.humanTokens(r.tokens)))", attributes: [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: para]))
+            s.append(NSAttributedString(string: "\t" + UI.humanCost(r.dollars, decimals: 2), attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+            return displayItem(s, indent: 32)
         }
     }
 
@@ -1188,6 +1230,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         barItem.submenu = barMenu
         items.append(barItem)
 
+        // Bascule : ventilation du coût par type de token, affichée en permanence.
+        let breakdownItem = NSMenuItem(
+            title: I18n.t("Show cost by token type", "Coût par type de token"),
+            action: #selector(toggleTokenBreakdown), keyEquivalent: "")
+        breakdownItem.target = self
+        breakdownItem.state = TokenBreakdownPref.enabled ? .on : .off
+        items.append(breakdownItem)
+
         // Sous-menu de langue.
         let langItem = NSMenuItem(title: I18n.t("Language", "Langue"), action: nil, keyEquivalent: "")
         let langMenu = NSMenu()
@@ -1218,6 +1268,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let u = lastUsage { updateTitle(u); rebuildMenu(usage: u) }
     }
 
+    /// Active/désactive l'affichage permanent de la ventilation du coût par type de token.
+    @objc func toggleTokenBreakdown() {
+        TokenBreakdownPref.toggle()
+        if let u = lastUsage { rebuildMenu(usage: u) }
+    }
+
     /// Change la langue de l'interface et reconstruit l'affichage immédiatement.
     @objc func changeLanguage(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let l = Lang(rawValue: raw),
@@ -1241,6 +1297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func claudeItems(_ u: Usage) -> [NSMenuItem] {
         let name = u.claudePlan.map { "Claude · \($0)" } ?? "Claude"
         var items = [providerHeader(name, cost: u.todayCost, toolTip: costTooltip(u))]
+        if TokenBreakdownPref.enabled { items += tokenBreakdownItems(u) }
         items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: u.fiveHour)
         items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: u.sevenDay)
         return items
