@@ -30,6 +30,29 @@ enum I18n {
     static var locale: Locale { Locale(identifier: current == .fr ? "fr_FR" : "en_US") }
 }
 
+// MARK: - Fournisseur affiché dans la barre de menus
+
+/// Quel fournisseur la BARRE DE MENUS affiche (le menu déroulant, lui, montre
+/// toujours les deux). Pratique quand l'un des deux est à sec : on bascule sur
+/// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
+enum BarProvider: String, CaseIterable {
+    case claude, codex
+    var menuTitle: String { self == .codex ? "Codex" : "Claude" }
+}
+
+enum BarPref {
+    private static let key = "widgetBarProvider"
+    private(set) static var current: BarProvider = {
+        if let s = UserDefaults.standard.string(forKey: key), let p = BarProvider(rawValue: s) { return p }
+        return .claude   // Claude par défaut
+    }()
+
+    static func set(_ p: BarProvider) {
+        current = p
+        UserDefaults.standard.set(p.rawValue, forKey: key)
+    }
+}
+
 // MARK: - Modèle
 
 /// Une limite renvoyée par l'API : `utilization` est un pourcentage 0–100 de
@@ -510,7 +533,9 @@ enum Ccusage {
         var d = Data()
 
         // Claude — coût + tokens du jour (coût API équivalent cumulé aujourd'hui).
-        if let obj = run(["daily", "--since", dayString(0), "--json"]),
+        // IMPORTANT : `claude daily` (Claude SEUL), pas `daily` (= tous les agents
+        // confondus, qui inclurait Codex/autres et le compterait en double).
+        if let obj = run(["claude", "daily", "--since", dayString(0), "--json"]),
            let daily = obj["daily"] as? [[String: Any]] {
             d.todayCost = daily.reduce(0.0) { $0 + (num($1["totalCost"]) ?? 0) }
             d.todayTokens = daily.reduce(0.0) { $0 + (num($1["totalTokens"]) ?? 0) }
@@ -954,11 +979,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 attributes: [.font: mono, .foregroundColor: color]))
         }
 
-        segment(symbol: "hourglass", fallback: "5h", limit: usage.fiveHour)
-        s.append(NSAttributedString(string: "   ", attributes: [.font: mono]))
-        segment(symbol: "calendar", fallback: "7j", limit: usage.sevenDay)
+        // Fournisseur choisi (menu « Menu bar »). Le coût suit le même fournisseur
+        // pour que toute la barre parle de la même chose.
+        let cost: Double?
+        switch BarPref.current {
+        case .claude:
+            segment(symbol: "hourglass", fallback: "5h", limit: usage.fiveHour)
+            s.append(NSAttributedString(string: "   ", attributes: [.font: mono]))
+            segment(symbol: "calendar", fallback: "7j", limit: usage.sevenDay)
+            cost = usage.todayCost
+        case .codex:
+            if let f = usage.codexFiveHour {          // Codex n'a plus de 5 h depuis 2026,
+                segment(symbol: "hourglass", fallback: "5h", limit: f)   // mais on gère
+                s.append(NSAttributedString(string: "   ", attributes: [.font: mono]))
+            }
+            segment(symbol: "calendar", fallback: "7j", limit: usage.codexSevenDay)
+            cost = usage.codexTodayCost
+        }
 
-        if let cost = usage.totalTodayCost {
+        if let cost = cost {
             s.append(NSAttributedString(string: "   " + UI.humanCost(cost),
                 attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
         }
@@ -1092,6 +1131,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         items.append(.separator())
 
+        // Sous-menu : quel fournisseur afficher dans la barre de menus.
+        let barItem = NSMenuItem(title: I18n.t("Menu bar", "Barre de menus"), action: nil, keyEquivalent: "")
+        let barMenu = NSMenu()
+        for p in BarProvider.allCases {
+            let it = NSMenuItem(title: p.menuTitle, action: #selector(changeBarProvider(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = p.rawValue
+            it.state = (p == BarPref.current) ? .on : .off
+            barMenu.addItem(it)
+        }
+        barItem.submenu = barMenu
+        items.append(barItem)
+
         // Sous-menu de langue.
         let langItem = NSMenuItem(title: I18n.t("Language", "Langue"), action: nil, keyEquivalent: "")
         let langMenu = NSMenu()
@@ -1112,6 +1164,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quitItem.target = self
         items.append(quitItem)
         return items
+    }
+
+    /// Change le fournisseur affiché dans la barre de menus (effet immédiat).
+    @objc func changeBarProvider(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let p = BarProvider(rawValue: raw),
+              p != BarPref.current else { return }
+        BarPref.set(p)
+        if let u = lastUsage { updateTitle(u); rebuildMenu(usage: u) }
     }
 
     /// Change la langue de l'interface et reconstruit l'affichage immédiatement.

@@ -88,10 +88,13 @@ updates when Codex makes a call), the widget shows the **age of the last reading
 reading X ago") so you know the figures are from your last Codex call, not real time.
 
 ### Cost & tokens
-`ccusage daily` (Claude) and `ccusage codex daily` (Codex) provide today's cost and token
-counts. Note the **Claude cost reflects Claude Code (CLI) usage only** — Claude Desktop chats
-aren't logged locally, so they aren't counted there (the **quota %**, being server-side, still
-covers everything).
+`ccusage claude daily` (Claude only — not the agent-wide `ccusage daily`, which would fold in
+Codex and others) and `ccusage codex daily` (Codex) provide today's cost and token counts. Each
+cost is the **equivalent API price** — `input × in-price + output × out-price + cache-write ×
+write-price + cache-read × read-price`, summed per model. It's what the usage *would* cost
+pay-as-you-go, **not** what a subscription actually bills. Note the **Claude cost reflects Claude
+Code (CLI) usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here
+(the **quota %**, being server-side, still covers everything).
 
 ## Language
 
