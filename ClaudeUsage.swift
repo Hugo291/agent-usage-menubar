@@ -75,6 +75,11 @@ struct Usage: Codable {
     var todayCost: Double?
     /// Tokens Claude consommés aujourd'hui (ccusage).
     var todayTokens: Double?
+    /// Ventilation Claude par type de token (infobulle au survol du coût).
+    var todayInput: Double?
+    var todayOutput: Double?
+    var todayCacheWrite: Double?
+    var todayCacheRead: Double?
     /// Codex (OpenAI), via `ccusage codex` — coût + tokens du jour.
     var codexTodayCost: Double?
     var codexTodayTokens: Double?
@@ -459,6 +464,10 @@ enum Fetcher {
             let c = Ccusage.read()
             u.todayCost = c.todayCost
             u.todayTokens = c.todayTokens
+            u.todayInput = c.todayInput
+            u.todayOutput = c.todayOutput
+            u.todayCacheWrite = c.todayCacheWrite
+            u.todayCacheRead = c.todayCacheRead
             u.codexTodayCost = c.codexTodayCost
             u.codexTodayTokens = c.codexTodayTokens
             dbg("ccusage coût=\(String(describing: c.todayCost)) tokens=\(String(describing: c.todayTokens)) codex=\(String(describing: c.codexTodayCost))")
@@ -520,6 +529,11 @@ enum Ccusage {
         var todayTokens: Double?        // Claude, tokens du jour
         var codexTodayCost: Double?     // Codex, coût du jour
         var codexTodayTokens: Double?   // Codex, tokens du jour
+        // Ventilation Claude par type de token (pour l'infobulle au survol).
+        var todayInput: Double?
+        var todayOutput: Double?
+        var todayCacheWrite: Double?
+        var todayCacheRead: Double?
     }
 
     private static func dayString(_ offsetDays: Double) -> String {
@@ -537,8 +551,13 @@ enum Ccusage {
         // confondus, qui inclurait Codex/autres et le compterait en double).
         if let obj = run(["claude", "daily", "--since", dayString(0), "--json"]),
            let daily = obj["daily"] as? [[String: Any]] {
-            d.todayCost = daily.reduce(0.0) { $0 + (num($1["totalCost"]) ?? 0) }
-            d.todayTokens = daily.reduce(0.0) { $0 + (num($1["totalTokens"]) ?? 0) }
+            func sum(_ k: String) -> Double { daily.reduce(0.0) { $0 + (num($1[k]) ?? 0) } }
+            d.todayCost = sum("totalCost")
+            d.todayTokens = sum("totalTokens")
+            d.todayInput = sum("inputTokens")
+            d.todayOutput = sum("outputTokens")
+            d.todayCacheWrite = sum("cacheCreationTokens")
+            d.todayCacheRead = sum("cacheReadTokens")
         }
 
         // Codex (OpenAI) — coût + tokens du jour. Clé de coût = `costUSD` (≠ `totalCost`
@@ -1007,7 +1026,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Construction du menu déroulant
 
     /// Ligne d'affichage colorée et non grisée (NSTextField dans un view custom).
-    private func displayItem(_ attr: NSAttributedString, indent: CGFloat = 20) -> NSMenuItem {
+    private func displayItem(_ attr: NSAttributedString, indent: CGFloat = 20,
+                             toolTip: String? = nil) -> NSMenuItem {
         let item = NSMenuItem()
         let field = NSTextField(labelWithAttributedString: attr)
         field.isBezeled = false
@@ -1019,6 +1039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: field.frame.height + 6))
         field.frame.origin = NSPoint(x: indent, y: 3)
         container.addSubview(field)
+        if let t = toolTip { container.toolTip = t; field.toolTip = t }
         item.view = container
         return item
     }
@@ -1061,7 +1082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// En-tête d'un fournisseur : nom (gras) à gauche, coût du jour (discret) à droite.
-    private func providerHeader(_ name: String, cost: Double?) -> NSMenuItem {
+    private func providerHeader(_ name: String, cost: Double?, toolTip: String? = nil) -> NSMenuItem {
         let para = NSMutableParagraphStyle()
         para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
         let s = NSMutableAttributedString(string: name, attributes: [
@@ -1072,7 +1093,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: para]))
         }
-        return displayItem(s, indent: 16)
+        return displayItem(s, indent: 16, toolTip: toolTip)
+    }
+
+    /// Infobulle « où part le coût » : ventilation Claude du jour PAR TYPE de token, en
+    /// dollars. Les ratios de prix Anthropic (output 5×, cache-write 1,25×, cache-read
+    /// 0,1× l'input) sont IDENTIQUES pour tous les modèles → on peut répartir le coût
+    /// total connu par type sans coder de prix en dur ni connaître le mix de modèles.
+    private func costTooltip(_ u: Usage) -> String? {
+        guard let i = u.todayInput, let o = u.todayOutput,
+              let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
+              let total = u.todayCost, total > 0 else { return nil }
+        let rows: [(label: String, tokens: Double, weight: Double)] = [
+            (I18n.t("cache read", "cache read"),  cr, cr * 0.1),
+            (I18n.t("cache write", "cache write"), cw, cw * 1.25),
+            (I18n.t("output", "output"),           o,  o * 5),
+            (I18n.t("input", "input"),             i,  i * 1),
+        ]
+        let W = rows.reduce(0.0) { $0 + $1.weight }
+        guard W > 0 else { return nil }
+        let head = I18n.t("Claude cost today — \(UI.humanCost(total, decimals: 2)) (est. by token type):",
+                          "Coût Claude du jour — \(UI.humanCost(total, decimals: 2)) (est. par type) :")
+        return rows.sorted { $0.weight > $1.weight }.reduce(head) { acc, r in
+            acc + "\n  \(UI.humanCost(total * r.weight / W, decimals: 2))  \(r.label)  (\(UI.humanTokens(r.tokens)))"
+        }
     }
 
     /// Une fenêtre de quota : ligne compacte (icône + libellé · barre fine · « X% »),
@@ -1196,7 +1240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Section Claude : en-tête (plan + coût du jour), puis fenêtres 5 h et hebdo.
     private func claudeItems(_ u: Usage) -> [NSMenuItem] {
         let name = u.claudePlan.map { "Claude · \($0)" } ?? "Claude"
-        var items = [providerHeader(name, cost: u.todayCost)]
+        var items = [providerHeader(name, cost: u.todayCost, toolTip: costTooltip(u))]
         items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: u.fiveHour)
         items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: u.sevenDay)
         return items

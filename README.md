@@ -92,9 +92,11 @@ reading X ago") so you know the figures are from your last Codex call, not real 
 Codex and others) and `ccusage codex daily` (Codex) provide today's cost and token counts. Each
 cost is the **equivalent API price** — `input × in-price + output × out-price + cache-write ×
 write-price + cache-read × read-price`, summed per model. It's what the usage *would* cost
-pay-as-you-go, **not** what a subscription actually bills. Note the **Claude cost reflects Claude
-Code (CLI) usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here
-(the **quota %**, being server-side, still covers everything).
+pay-as-you-go, **not** what a subscription actually bills. **Hover the Claude cost** in the menu
+for a per-token-type split ($ on cache read / cache write / output / input) — usually a reminder
+that cache, not output, drives the number. Note the **Claude cost reflects Claude Code (CLI)
+usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here (the
+**quota %**, being server-side, still covers everything).
 
 ## Language
 
