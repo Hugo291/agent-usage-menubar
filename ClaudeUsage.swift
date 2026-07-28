@@ -36,8 +36,17 @@ enum I18n {
 /// toujours les deux). Pratique quand l'un des deux est à sec : on bascule sur
 /// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
 enum BarProvider: String, CaseIterable {
-    case claude, codex
-    var menuTitle: String { self == .codex ? "Codex" : "Claude" }
+    case claude, codex, both
+    var menuTitle: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex:  return "Codex"
+        case .both:   return I18n.t("Both", "Les deux")
+        }
+    }
+    /// Initiale affichée devant chaque groupe en mode « les deux », pour lever
+    /// l'ambiguïté sans manger la largeur de la barre.
+    var tag: String { self == .codex ? "X" : "C" }
 }
 
 enum BarPref {
@@ -1060,22 +1069,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 attributes: [.font: mono, .foregroundColor: color]))
         }
 
+        /// Initiale du fournisseur (mode « les deux » uniquement), en teinte discrète.
+        func tag(_ p: BarProvider) {
+            s.append(NSAttributedString(string: p.tag + " ", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        func gap() { s.append(NSAttributedString(string: "   ", attributes: [.font: mono])) }
+
+        func claudeSegments() {
+            segment(symbol: "hourglass", fallback: "5h", limit: usage.fiveHour)
+            gap()
+            segment(symbol: "calendar", fallback: "7j", limit: usage.sevenDay)
+        }
+        func codexSegments() {
+            if let f = usage.codexFiveHour {          // Codex n'a plus de 5 h depuis 2026,
+                segment(symbol: "hourglass", fallback: "5h", limit: f)   // mais on gère
+                gap()
+            }
+            segment(symbol: "calendar", fallback: "7j", limit: usage.codexSevenDay)
+        }
+
         // Fournisseur choisi (menu « Menu bar »). Le coût suit le même fournisseur
-        // pour que toute la barre parle de la même chose.
+        // pour que toute la barre parle de la même chose ; en mode « les deux » c'est
+        // le cumul, cohérent avec le pied du menu déroulant.
         let cost: Double?
         switch BarPref.current {
         case .claude:
-            segment(symbol: "hourglass", fallback: "5h", limit: usage.fiveHour)
-            s.append(NSAttributedString(string: "   ", attributes: [.font: mono]))
-            segment(symbol: "calendar", fallback: "7j", limit: usage.sevenDay)
+            claudeSegments()
             cost = usage.todayCost
         case .codex:
-            if let f = usage.codexFiveHour {          // Codex n'a plus de 5 h depuis 2026,
-                segment(symbol: "hourglass", fallback: "5h", limit: f)   // mais on gère
-                s.append(NSAttributedString(string: "   ", attributes: [.font: mono]))
-            }
-            segment(symbol: "calendar", fallback: "7j", limit: usage.codexSevenDay)
+            codexSegments()
             cost = usage.codexTodayCost
+        case .both:
+            tag(.claude); claudeSegments()
+            gap()
+            tag(.codex);  codexSegments()
+            cost = usage.totalTodayCost
         }
 
         if let cost = cost {
@@ -1480,9 +1510,19 @@ func printUsage(_ u: Usage) {
         print("Tokens (jour): Claude \(UI.humanTokens(t))" +
               (u.codexTodayTokens.map { $0 > 0 ? "  ·  Codex \(UI.humanTokens($0))" : "" } ?? ""))
     }
-    print(String(format: "Titre barre  : 5h %.0f%%  ·  7j %.0f%%%@",
-                 u.fiveHour?.remaining ?? 0, u.sevenDay?.remaining ?? 0,
-                 u.totalTodayCost.map { "  ·  " + UI.humanCost($0) } ?? ""))
+    // Reflète le mode réellement choisi (menu « Barre de menus »), coût compris.
+    func pct(_ l: Limit?) -> String { l.map { String(format: "%.0f%%", $0.remaining) } ?? "—" }
+    let claudeBar = "5h \(pct(u.fiveHour))  ·  7j \(pct(u.sevenDay))"
+    let codexBar = (u.codexFiveHour.map { "5h \(pct($0))  ·  " } ?? "") + "7j \(pct(u.codexSevenDay))"
+    let (barBody, barCost): (String, Double?) = {
+        switch BarPref.current {
+        case .claude: return (claudeBar, u.todayCost)
+        case .codex:  return (codexBar, u.codexTodayCost)
+        case .both:   return ("C \(claudeBar)   X \(codexBar)", u.totalTodayCost)
+        }
+    }()
+    print("Titre barre  : [\(BarPref.current.menuTitle)] \(barBody)"
+          + (barCost.map { "  ·  " + UI.humanCost($0) } ?? ""))
     print("— Claude" + (u.claudePlan.map { " (plan \($0))" } ?? "") + " —")
     line("Fenêtre 5 h ", u.fiveHour)
     line("Quota hebdo ", u.sevenDay)

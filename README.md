@@ -13,7 +13,7 @@ Click them for the full breakdown.
 **▶︎ Live demo & screenshot:** <https://hugo291.github.io/agent-usage-menubar/>
 
 ```
-  ⌛70%  🗓20%  $437            ← menu bar (combined cost = Claude + Codex)
+  ⌛70%  🗓20%  $436            ← menu bar (here: Claude — see "Menu bar" below)
 ┌────────────────────────────────────┐
 │ Usage — Claude + Codex             │
 │ Claude · max                 $436  │
@@ -26,9 +26,23 @@ Click them for the full breakdown.
 │    resets Mon 21 Jul · in 74 h     │
 │  last reading 2 min ago            │
 │ Today $437 · ~$768 projected       │
-│ Language ▸ · Refresh · Quit        │
+│ Menu bar ▸ · Language ▸ · Refresh  │
 └────────────────────────────────────┘
 ```
+
+## What the menu bar shows
+
+The dropdown always lists **both** providers. The bar itself is yours to choose, from the
+**Menu bar** submenu — handy when one provider runs dry and you want the other under your eyes
+without clicking:
+
+| Choice | Bar shows |
+|---|---|
+| **Claude** (default) | Claude's 5h + weekly, and Claude's cost |
+| **Codex** | Codex's weekly, and Codex's cost |
+| **Both** | `C ⌛70% 🗓20%  X 🗓78%  $437` — each provider tagged (**C**laude / Code**x**), with the **combined** cost |
+
+The cost always follows the same choice, so the whole bar talks about one thing.
 
 ## Install
 
