@@ -118,9 +118,11 @@ cost by token type** in the menu to pin the breakdown as its own rows under each
 split needs no hardcoded prices: it distributes the known total using price *ratios* only.
 - **Claude** — cache read / cache write / output / input. Anthropic's ratios are identical on
   every model (output 5×, cache-write 1.25×, cache-read 0.1× input), so the split is exact.
-- **Codex** — cache read / output / input. OpenAI bills no cache *writes*, and cache-read is
-  0.1× input across the whole GPT-5 family; the output multiplier is 8× up to gpt-5.3 and 6×
-  from gpt-5.4 on, read from the model name and averaged when a day mixes models.
+- **Codex** — cache read / output / input. Cache-read is 0.1× input across the whole GPT-5
+  family; the output multiplier is 8× up to gpt-5.3 and 6× from gpt-5.4 on, read from the model
+  name and averaged when a day mixes models. There is no cache-*write* row: Codex does log a
+  `cache_write_input_tokens` counter, but it reads 0 in practice and `ccusage`'s Codex parser
+  never looks at it — so no write cost enters the total being split.
 
 Note the **Claude cost reflects Claude Code (CLI)
 usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here (the

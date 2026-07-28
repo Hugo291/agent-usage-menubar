@@ -622,10 +622,12 @@ enum Ccusage {
             func sum(_ k: String) -> Double { daily.reduce(0.0) { $0 + (num($1[k]) ?? 0) } }
             d.codexTodayCost = sum("costUSD")
             d.codexTodayTokens = sum("totalTokens")
-            // `cachedInputTokens` est un SOUS-ENSEMBLE de `inputTokens` (vérifié :
-            // totalTokens == inputTokens + outputTokens) → l'input facturé plein tarif
-            // est la différence. Idem `reasoningOutputTokens` ⊂ `outputTokens` : déjà
-            // compté, on ne l'ajoute pas.
+            // `cachedInputTokens` = du cache READ : ccusage le lit comme
+            // `cached_input_tokens ?? cache_read_input_tokens` et le tarife au
+            // `cache_read_input_token_cost`. C'est un SOUS-ENSEMBLE de `inputTokens`
+            // (vérifié : totalTokens == inputTokens + outputTokens) → l'input facturé
+            // plein tarif est la différence. Idem `reasoningOutputTokens` ⊂
+            // `outputTokens` : déjà compté, on ne l'ajoute pas.
             let cached = sum("cachedInputTokens")
             d.codexTodayCacheRead = cached
             d.codexTodayInput = max(0, sum("inputTokens") - cached)
@@ -1217,9 +1219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
     }
 
-    /// Codex : côté OpenAI le cache read vaut 0,1× l'input sur toute la famille GPT-5,
-    /// et il n'y a PAS d'écriture de cache facturée — d'où 3 postes seulement. Le
-    /// rapport output/input dépend de la génération du modèle (cf. `Ccusage.outputRatio`).
+    /// Codex : 3 postes seulement. Le cache read vaut 0,1× l'input sur toute la famille
+    /// GPT-5 ; le rapport output/input dépend de la génération (cf. `Ccusage.outputRatio`).
+    /// PAS de poste « cache write » : Codex loggue bien un `cache_write_input_tokens`,
+    /// mais (a) il vaut 0 sur tout l'historique local, et (b) le parseur Codex de ccusage
+    /// ne le lit même pas → aucun coût d'écriture n'entre dans le total qu'on répartit.
+    /// Si OpenAI se met à le facturer, c'est le TOTAL de ccusage qui sera incomplet ; la
+    /// répartition ci-dessous, elle, restera cohérente (les lignes somment au total).
     private func codexBreakdown(_ u: Usage) -> [Split]? {
         guard let i = u.codexTodayInput, let o = u.codexTodayOutput,
               let cr = u.codexTodayCacheRead, let total = u.codexTodayCost else { return nil }
