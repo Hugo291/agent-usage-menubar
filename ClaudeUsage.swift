@@ -97,6 +97,15 @@ struct Usage: Codable {
     /// Codex (OpenAI), via `ccusage codex` — coût + tokens du jour.
     var codexTodayCost: Double?
     var codexTodayTokens: Double?
+    /// Ventilation Codex par type de token. Côté OpenAI il n'y a PAS d'écriture de
+    /// cache facturée : `codexTodayInput` est l'input NON caché (= inputTokens −
+    /// cachedInputTokens) et `codexTodayCacheRead` la part cachée, facturée 0,1×.
+    var codexTodayInput: Double?
+    var codexTodayCacheRead: Double?
+    var codexTodayOutput: Double?
+    /// Multiplicateur de prix output/input du jour (6× ou 8× selon la génération du
+    /// modèle, moyenné par tokens quand plusieurs modèles ont servi).
+    var codexOutputRatio: Double?
     /// Quotas Codex (fenêtre 5 h + hebdo) lus dans les sessions du CLI Codex.
     var codexFiveHour: Limit?
     var codexSevenDay: Limit?
@@ -484,6 +493,10 @@ enum Fetcher {
             u.todayCacheRead = c.todayCacheRead
             u.codexTodayCost = c.codexTodayCost
             u.codexTodayTokens = c.codexTodayTokens
+            u.codexTodayInput = c.codexTodayInput
+            u.codexTodayCacheRead = c.codexTodayCacheRead
+            u.codexTodayOutput = c.codexTodayOutput
+            u.codexOutputRatio = c.codexOutputRatio
             dbg("ccusage coût=\(String(describing: c.todayCost)) tokens=\(String(describing: c.todayTokens)) codex=\(String(describing: c.codexTodayCost))")
 
             // Quotas Codex (5 h + hebdo), lus dans les sessions du CLI Codex.
@@ -548,6 +561,22 @@ enum Ccusage {
         var todayOutput: Double?
         var todayCacheWrite: Double?
         var todayCacheRead: Double?
+        // Ventilation Codex (OpenAI) — input non caché / cache read / output.
+        var codexTodayInput: Double?
+        var codexTodayCacheRead: Double?
+        var codexTodayOutput: Double?
+        var codexOutputRatio: Double?
+    }
+
+    /// Rapport prix output/input d'un modèle OpenAI. Vérifié sur la table de prix
+    /// LiteLLM (celle qu'utilise ccusage) en juillet 2026 : sur TOUTE la famille GPT-5
+    /// le cache read vaut uniformément 0,1× l'input, mais l'output vaut 8× l'input
+    /// jusqu'à gpt-5.3 et 6× à partir de gpt-5.4. On lit donc le numéro de génération
+    /// dans le nom du modèle (« gpt-5.6-sol » → 5.6). Défaut = 6× (génération courante).
+    private static func outputRatio(model: String) -> Double {
+        guard let r = model.range(of: #"[0-9]+(\.[0-9]+)?"#, options: .regularExpression),
+              let v = Double(model[r]) else { return 6 }
+        return v < 5.4 ? 8 : 6
     }
 
     private static func dayString(_ offsetDays: Double) -> String {
@@ -578,8 +607,27 @@ enum Ccusage {
         // côté Claude). Sous-commande absente sur les vieilles ccusage → champs nil.
         if let obj = run(["codex", "daily", "--since", dayString(0), "--json"]),
            let daily = obj["daily"] as? [[String: Any]] {
-            d.codexTodayCost = daily.reduce(0.0) { $0 + (num($1["costUSD"]) ?? 0) }
-            d.codexTodayTokens = daily.reduce(0.0) { $0 + (num($1["totalTokens"]) ?? 0) }
+            func sum(_ k: String) -> Double { daily.reduce(0.0) { $0 + (num($1[k]) ?? 0) } }
+            d.codexTodayCost = sum("costUSD")
+            d.codexTodayTokens = sum("totalTokens")
+            // `cachedInputTokens` est un SOUS-ENSEMBLE de `inputTokens` (vérifié :
+            // totalTokens == inputTokens + outputTokens) → l'input facturé plein tarif
+            // est la différence. Idem `reasoningOutputTokens` ⊂ `outputTokens` : déjà
+            // compté, on ne l'ajoute pas.
+            let cached = sum("cachedInputTokens")
+            d.codexTodayCacheRead = cached
+            d.codexTodayInput = max(0, sum("inputTokens") - cached)
+            d.codexTodayOutput = sum("outputTokens")
+            // Multiplicateur output moyen, pondéré par les tokens de sortie de chaque
+            // modèle utilisé aujourd'hui (une journée peut en mêler plusieurs).
+            var wsum = 0.0, tsum = 0.0
+            for day in daily {
+                for (model, v) in (day["models"] as? [String: Any]) ?? [:] {
+                    let o = num((v as? [String: Any])?["outputTokens"]) ?? 0
+                    wsum += o * outputRatio(model: model); tsum += o
+                }
+            }
+            d.codexOutputRatio = tsum > 0 ? wsum / tsum : nil
         }
 
         return d
@@ -1114,28 +1162,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// dollars. Les ratios de prix Anthropic (output 5×, cache-write 1,25×, cache-read
     /// 0,1× l'input) sont IDENTIQUES pour tous les modèles → on peut répartir le coût
     /// total connu par type sans coder de prix en dur ni connaître le mix de modèles.
-    private func costBreakdown(_ u: Usage) -> [(label: String, dollars: Double, tokens: Double)]? {
-        guard let i = u.todayInput, let o = u.todayOutput,
-              let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
-              let total = u.todayCost, total > 0 else { return nil }
-        let rows: [(label: String, tokens: Double, weight: Double)] = [
-            (I18n.t("cache read", "cache read"),  cr, cr * 0.1),
-            (I18n.t("cache write", "cache write"), cw, cw * 1.25),
-            (I18n.t("output", "output"),           o,  o * 5),
-            (I18n.t("input", "input"),             i,  i * 1),
-        ]
+    private typealias Split = (label: String, dollars: Double, tokens: Double)
+
+    /// Répartit un coût TOTAL connu entre types de tokens, à partir des seuls rapports
+    /// de prix (pas de prix en dur, donc pas de dérive quand les tarifs changent).
+    private func split(total: Double, _ rows: [(label: String, tokens: Double, weight: Double)]) -> [Split]? {
         let W = rows.reduce(0.0) { $0 + $1.weight }
-        guard W > 0 else { return nil }
+        guard total > 0, W > 0 else { return nil }
         return rows.sorted { $0.weight > $1.weight }.map {
             (label: $0.label, dollars: total * $0.weight / W, tokens: $0.tokens)
         }
     }
 
+    /// Claude : rapports Anthropic IDENTIQUES sur tous les modèles (output 5×,
+    /// cache-write 1,25×, cache-read 0,1× l'input) → répartition exacte.
+    private func claudeBreakdown(_ u: Usage) -> [Split]? {
+        guard let i = u.todayInput, let o = u.todayOutput,
+              let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
+              let total = u.todayCost else { return nil }
+        return split(total: total, [
+            (I18n.t("cache read", "cache read"),   cr, cr * 0.1),
+            (I18n.t("cache write", "cache write"), cw, cw * 1.25),
+            (I18n.t("output", "output"),            o, o * 5),
+            (I18n.t("input", "input"),              i, i * 1),
+        ])
+    }
+
+    /// Codex : côté OpenAI le cache read vaut 0,1× l'input sur toute la famille GPT-5,
+    /// et il n'y a PAS d'écriture de cache facturée — d'où 3 postes seulement. Le
+    /// rapport output/input dépend de la génération du modèle (cf. `Ccusage.outputRatio`).
+    private func codexBreakdown(_ u: Usage) -> [Split]? {
+        guard let i = u.codexTodayInput, let o = u.codexTodayOutput,
+              let cr = u.codexTodayCacheRead, let total = u.codexTodayCost else { return nil }
+        let m = u.codexOutputRatio ?? 6
+        return split(total: total, [
+            (I18n.t("cache read", "cache read"), cr, cr * 0.1),
+            (I18n.t("output", "output"),          o, o * m),
+            (I18n.t("input", "input"),            i, i * 1),
+        ])
+    }
+
     /// Même ventilation, en texte multi-ligne pour l'infobulle du coût.
-    private func costTooltip(_ u: Usage) -> String? {
-        guard let rows = costBreakdown(u), let total = u.todayCost else { return nil }
-        let head = I18n.t("Claude cost today — \(UI.humanCost(total, decimals: 2)) (est. by token type):",
-                          "Coût Claude du jour — \(UI.humanCost(total, decimals: 2)) (est. par type) :")
+    private func costTooltip(_ rows: [Split]?, provider: String, total: Double?) -> String? {
+        guard let rows = rows, let total = total else { return nil }
+        let head = I18n.t("\(provider) cost today — \(UI.humanCost(total, decimals: 2)) (est. by token type):",
+                          "Coût \(provider) du jour — \(UI.humanCost(total, decimals: 2)) (est. par type) :")
         return rows.reduce(head) { acc, r in
             acc + "\n  \(UI.humanCost(r.dollars, decimals: 2))  \(r.label)  (\(UI.humanTokens(r.tokens)))"
         }
@@ -1143,8 +1214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Même ventilation, en lignes de menu (option « toujours afficher ») : libellé +
     /// nombre de tokens à gauche, dollars alignés à droite, nichée sous l'en-tête coût.
-    private func tokenBreakdownItems(_ u: Usage) -> [NSMenuItem] {
-        guard let rows = costBreakdown(u) else { return [] }
+    private func tokenBreakdownItems(_ rows: [Split]?) -> [NSMenuItem] {
+        guard let rows = rows else { return [] }
         let para = NSMutableParagraphStyle()
         para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
         return rows.map { r in
@@ -1296,8 +1367,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Section Claude : en-tête (plan + coût du jour), puis fenêtres 5 h et hebdo.
     private func claudeItems(_ u: Usage) -> [NSMenuItem] {
         let name = u.claudePlan.map { "Claude · \($0)" } ?? "Claude"
-        var items = [providerHeader(name, cost: u.todayCost, toolTip: costTooltip(u))]
-        if TokenBreakdownPref.enabled { items += tokenBreakdownItems(u) }
+        let rows = claudeBreakdown(u)
+        var items = [providerHeader(name, cost: u.todayCost,
+                                    toolTip: costTooltip(rows, provider: "Claude", total: u.todayCost))]
+        if TokenBreakdownPref.enabled { items += tokenBreakdownItems(rows) }
         items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: u.fiveHour)
         items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: u.sevenDay)
         return items
@@ -1307,7 +1380,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// une seule hebdo) + l'âge du relevé (donnée passive : elle bouge quand Codex tourne).
     private func codexItems(_ u: Usage) -> [NSMenuItem] {
         let name = u.codexPlan.map { "Codex · \($0)" } ?? "Codex"
-        var items: [NSMenuItem] = [providerHeader(name, cost: u.codexTodayCost)]
+        let rows = codexBreakdown(u)
+        var items: [NSMenuItem] = [providerHeader(name, cost: u.codexTodayCost,
+                                                  toolTip: costTooltip(rows, provider: "Codex", total: u.codexTodayCost))]
+        if TokenBreakdownPref.enabled { items += tokenBreakdownItems(rows) }
         let hasQuota = (u.codexFiveHour != nil || u.codexSevenDay != nil)
         if let f = u.codexFiveHour {
             items += compactQuota(symbol: "hourglass", label: I18n.t("5h", "5h"), limit: f)
@@ -1418,6 +1494,16 @@ func printUsage(_ u: Usage) {
     if let asOf = u.codexAsOf { print("Codex relevé: \(UI.agoText(asOf))") }
     if let cc = u.codexTodayCost, let ct = u.codexTodayTokens {
         print("Codex (jour): \(UI.humanCost(cc, decimals: 2)) · \(UI.humanTokens(ct)) tokens")
+        if let i = u.codexTodayInput, let o = u.codexTodayOutput, let cr = u.codexTodayCacheRead, cc > 0 {
+            let m = u.codexOutputRatio ?? 6
+            let rows = [("cache read", cr, cr * 0.1), ("output", o, o * m), ("input", i, i * 1)]
+            let W = rows.reduce(0.0) { $0 + $1.2 }
+            for r in rows.sorted(by: { $0.2 > $1.2 }) where W > 0 {
+                let label = r.0.padding(toLength: 12, withPad: " ", startingAt: 0)
+                let money = UI.humanCost(cc * r.2 / W, decimals: 2)
+                print("  \(label)\(String(repeating: " ", count: max(0, 8 - money.count)))\(money)  (\(UI.humanTokens(r.1)))")
+            }
+        }
     } else if u.codexFiveHour == nil {
         print("Codex       : données indisponibles")
     }
@@ -1448,8 +1534,16 @@ if CommandLine.arguments.contains("--mock") {
     let c = Ccusage.read()
     u.todayCost = c.todayCost
     u.todayTokens = c.todayTokens
+    u.todayInput = c.todayInput
+    u.todayOutput = c.todayOutput
+    u.todayCacheWrite = c.todayCacheWrite
+    u.todayCacheRead = c.todayCacheRead
     u.codexTodayCost = c.codexTodayCost
     u.codexTodayTokens = c.codexTodayTokens
+    u.codexTodayInput = c.codexTodayInput
+    u.codexTodayCacheRead = c.codexTodayCacheRead
+    u.codexTodayOutput = c.codexTodayOutput
+    u.codexOutputRatio = c.codexOutputRatio
     u.claudePlan = Auth.subscriptionType()
     let cl = CodexLimits.read()
     u.codexFiveHour = cl.fiveHour
