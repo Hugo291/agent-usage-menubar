@@ -36,17 +36,20 @@ enum I18n {
 /// toujours les deux). Pratique quand l'un des deux est à sec : on bascule sur
 /// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
 enum BarProvider: String, CaseIterable {
-    case claude, codex, both
+    case claude, codex
+    /// Cumul : la barre ne montre que le coût TOTAL du jour (Claude + Codex). Les
+    /// pourcentages, eux, ne se cumulent pas (deux ressources distinctes : 70 % de
+    /// Claude + 78 % de Codex ne veut rien dire) → ils restent dans le menu déroulant.
+    /// `rawValue` historique « both » : ne pas renommer, la préférence est persistée.
+    case total = "both"
+
     var menuTitle: String {
         switch self {
         case .claude: return "Claude"
         case .codex:  return "Codex"
-        case .both:   return I18n.t("Both", "Les deux")
+        case .total:  return I18n.t("Total cost", "Coût cumulé")
         }
     }
-    /// Initiale affichée devant chaque groupe en mode « les deux », pour lever
-    /// l'ambiguïté sans manger la largeur de la barre.
-    var tag: String { self == .codex ? "X" : "C" }
 }
 
 enum BarPref {
@@ -1069,12 +1072,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 attributes: [.font: mono, .foregroundColor: color]))
         }
 
-        /// Initiale du fournisseur (mode « les deux » uniquement), en teinte discrète.
-        func tag(_ p: BarProvider) {
-            s.append(NSAttributedString(string: p.tag + " ", attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: NSColor.secondaryLabelColor]))
-        }
         func gap() { s.append(NSAttributedString(string: "   ", attributes: [.font: mono])) }
 
         func claudeSegments() {
@@ -1091,8 +1088,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Fournisseur choisi (menu « Menu bar »). Le coût suit le même fournisseur
-        // pour que toute la barre parle de la même chose ; en mode « les deux » c'est
-        // le cumul, cohérent avec le pied du menu déroulant.
+        // pour que toute la barre parle de la même chose ; en mode cumul c'est le
+        // total, cohérent avec le pied du menu déroulant.
         let cost: Double?
         switch BarPref.current {
         case .claude:
@@ -1101,16 +1098,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .codex:
             codexSegments()
             cost = usage.codexTodayCost
-        case .both:
-            tag(.claude); claudeSegments()
-            gap()
-            tag(.codex);  codexSegments()
-            cost = usage.totalTodayCost
+        case .total:
+            cost = usage.totalTodayCost   // pas de quotas : seul l'argent s'additionne
         }
 
         if let cost = cost {
-            s.append(NSAttributedString(string: "   " + UI.humanCost(cost),
+            s.append(NSAttributedString(string: (s.length > 0 ? "   " : "") + UI.humanCost(cost),
                 attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
+        } else if s.length == 0 {
+            // Mode cumul sans ccusage : sans ce repli la barre serait VIDE, donc le
+            // widget invisible et impossible à rouvrir pour changer d'option.
+            s.append(NSAttributedString(string: "$—",
+                attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
         }
         button.attributedTitle = s
     }
@@ -1518,11 +1517,11 @@ func printUsage(_ u: Usage) {
         switch BarPref.current {
         case .claude: return (claudeBar, u.todayCost)
         case .codex:  return (codexBar, u.codexTodayCost)
-        case .both:   return ("C \(claudeBar)   X \(codexBar)", u.totalTodayCost)
+        case .total:  return ("", u.totalTodayCost)
         }
     }()
     print("Titre barre  : [\(BarPref.current.menuTitle)] \(barBody)"
-          + (barCost.map { "  ·  " + UI.humanCost($0) } ?? ""))
+          + (barCost.map { (barBody.isEmpty ? "" : "  ·  ") + UI.humanCost($0) } ?? "$—"))
     print("— Claude" + (u.claudePlan.map { " (plan \($0))" } ?? "") + " —")
     line("Fenêtre 5 h ", u.fiveHour)
     line("Quota hebdo ", u.sevenDay)

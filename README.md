@@ -38,11 +38,15 @@ without clicking:
 
 | Choice | Bar shows |
 |---|---|
-| **Claude** (default) | Claude's 5h + weekly, and Claude's cost |
-| **Codex** | Codex's weekly, and Codex's cost |
-| **Both** | `C ⌛70% 🗓20%  X 🗓78%  $437` — each provider tagged (**C**laude / Code**x**), with the **combined** cost |
+| **Claude** (default) | `⌛70% 🗓20% $436` — Claude's 5h + weekly, and Claude's cost |
+| **Codex** | `🗓78% $0.75` — Codex's weekly, and Codex's cost |
+| **Total cost** | `$437` — the combined spend, nothing else |
 
 The cost always follows the same choice, so the whole bar talks about one thing.
+
+**Total cost** shows money only, on purpose: dollars add up across providers, percentages don't
+(70% left of Claude's weekly and 78% of Codex's are two unrelated resources — a sum or an average
+of them would be a made-up number). The percentages stay one click away in the dropdown.
 
 ## Install
 
