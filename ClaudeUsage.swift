@@ -1,5 +1,6 @@
 import Cocoa
 import UserNotifications
+import WidgetKit
 
 // MARK: - Internationalisation (langue de l'interface)
 
@@ -77,6 +78,63 @@ enum TokenBreakdownPref {
         UserDefaults.standard.set(on, forKey: key)
     }
     static func toggle() { set(!enabled) }
+}
+
+// MARK: - Alimentation du widget WidgetKit
+
+/// Le widget du Centre de notifications est une extension EN BAC À SABLE : elle ne
+/// peut ni lancer `ccusage`, ni lire le trousseau, ni fouiller `~/.codex`. C'est donc
+/// cette app (non sandboxée) qui joue le moteur et lui dépose un instantané dans SON
+/// conteneur — un bac à sable peut toujours lire son propre conteneur, ce qui évite
+/// un App Group (lequel exigerait un Team ID, donc un compte développeur payant).
+enum WidgetFeed {
+    static let extensionBundleID = "com.hugo.claudeusagewidget.widget"
+
+    /// `~/Library/Containers/<ext>/Data/Library/Caches/usage-snapshot.json` : côté
+    /// extension, c'est exactement ce que renvoie `.cachesDirectory`.
+    private static var snapshotURL: URL? {
+        let container = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers/\(extensionBundleID)/Data")
+        // Le conteneur est créé par le système au premier lancement de l'extension.
+        // On ne le fabrique PAS à la main : un dossier bricolé sans les métadonnées de
+        // containermanagerd risquerait d'empêcher l'extension de démarrer.
+        guard FileManager.default.fileExists(atPath: container.path) else { return nil }
+        let dir = container.appendingPathComponent("Library/Caches")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("usage-snapshot.json")
+    }
+
+    /// Écrit l'instantané puis demande au système de redessiner le widget.
+    static func publish(_ u: Usage, updated: Date) {
+        // Le rafraîchissement est demandé DANS TOUS LES CAS, même sans conteneur :
+        // c'est ce qui pousse le système à instancier l'extension une première fois
+        // (et donc à créer le conteneur où l'on pourra écrire au tour suivant).
+        defer { WidgetCenter.shared.reloadAllTimelines() }
+        guard let url = snapshotURL else { return }   // widget pas encore instancié
+        var d: [String: Any] = ["updated": updated.timeIntervalSince1970,
+                                "lang": I18n.current.rawValue]
+        func put(_ k: String, _ v: Double?) { if let v = v { d[k] = v } }
+        func put(_ k: String, _ v: String?) { if let v = v { d[k] = v } }
+        func limit(_ prefix: String, _ l: Limit?) {
+            guard let l = l else { return }
+            d[prefix] = l.remaining
+            if let r = l.resetsAt { d[prefix + "Reset"] = r.timeIntervalSince1970 }
+        }
+        put("claudePlan", u.claudePlan)
+        limit("claudeFiveHour", u.fiveHour)
+        limit("claudeWeek", u.sevenDay)
+        put("claudeCost", u.todayCost)
+        put("codexPlan", u.codexPlan)
+        limit("codexFiveHour", u.codexFiveHour)
+        limit("codexWeek", u.codexSevenDay)
+        put("codexCost", u.codexTodayCost)
+        put("codexAsOf", u.codexAsOf?.timeIntervalSince1970)
+        put("totalCost", u.totalTodayCost)
+        put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
+
+        guard let data = try? JSONSerialization.data(withJSONObject: d) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
 }
 
 // MARK: - Modèle
@@ -933,6 +991,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Adopte l'état des bornes de reset SANS notifier : on ne signale pas un
             // reset survenu pendant que l'app était fermée (les notifs sont temps réel).
             ResetWatcher.process(cached.usage, notify: false)
+            // Alimente aussi le widget : sans ça, un démarrage servi par le cache (ou
+            // bloqué par la porte de fraîcheur / un 429) le laisserait vide.
+            WidgetFeed.publish(cached.usage, updated: cached.savedAt)
         }
         Notifier.shared.configure()   // délégué + demande d'autorisation des notifs
         // Re-teinte les icônes quand la barre bascule clair ↔ sombre.
@@ -989,6 +1050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.lastUpdate = Date()
                 Cache.save(usage, at: self.lastUpdate!)
                 ResetWatcher.process(usage)   // détecte les reset → notif système
+                WidgetFeed.publish(usage, updated: self.lastUpdate!)
                 self.updateTitle(usage)
                 self.rebuildMenu(usage: usage)
             case .authError:

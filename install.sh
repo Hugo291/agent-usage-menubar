@@ -21,6 +21,8 @@ set -euo pipefail
 # ----------------------------------------------------------------- config ----
 APP_NAME="ClaudeUsageWidget"
 BUNDLE_ID="com.hugo.claudeusagewidget"        # must match the cache dir used in the code
+WIDGET_NAME="AgentUsageWidget"
+WIDGET_ID="$BUNDLE_ID.widget"                 # must match WidgetFeed.extensionBundleID
 REPO="https://github.com/Hugo291/agent-usage-menubar.git"
 SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
 INSTALL_DIR="$HOME/Applications"
@@ -42,7 +44,11 @@ uninstall() {
     || launchctl unload "$AGENT" 2>/dev/null || true
   rm -f "$AGENT"
   pkill -f "$APP_NAME.app/Contents/MacOS" 2>/dev/null || true
+  # Deregister the embedded widget before deleting, so it leaves the gallery.
+  LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  [ -x "$LSREG" ] && "$LSREG" -u "$APP" 2>/dev/null || true
   rm -rf "$APP"
+  rm -rf "$HOME/Library/Containers/$WIDGET_ID"
   ok "Uninstalled. Auto-start disabled and the app removed from ~/Applications."
   echo "  (Cached data, if any, stays in ~/Library/Caches/$BUNDLE_ID — harmless to delete.)"
   exit 0
@@ -83,9 +89,63 @@ swiftc -O -swift-version 5 \
     "$SRC_DIR/ClaudeUsage.swift" \
     -o "$STAGE/Contents/MacOS/$APP_NAME" \
     -framework Cocoa \
-    -framework UserNotifications
+    -framework UserNotifications \
+    -framework WidgetKit
+
+# ------------------------------------------- Notification Centre / desk widget ---
+# Optional extra: a WidgetKit extension embedded in the app. It is sandboxed, so it
+# never fetches anything itself — the menu-bar app drops a snapshot into the
+# extension's own container and asks the system to redraw. That container is also
+# why no App Group (and therefore no paid Apple Team ID) is needed.
+if [ -f "$SRC_DIR/AgentUsageWidget.swift" ]; then
+  say "Building the Notification Centre widget…"
+  AX="$STAGE/Contents/PlugIns/$WIDGET_NAME.appex"
+  mkdir -p "$AX/Contents/MacOS"
+  cat > "$AX/Contents/Info.plist" <<AXPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>$WIDGET_NAME</string>
+    <key>CFBundleIdentifier</key><string>$WIDGET_ID</string>
+    <key>CFBundleName</key><string>$WIDGET_NAME</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key><string>com.apple.widgetkit-extension</string>
+    </dict>
+</dict>
+</plist>
+AXPLIST
+  # A widget extension must be sandboxed; that is exactly why it is fed a snapshot.
+  ENT="$(mktemp)"
+  cat > "$ENT" <<'ENTPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key><true/>
+</dict>
+</plist>
+ENTPLIST
+  if swiftc -O -swift-version 5 -parse-as-library \
+        "$SRC_DIR/AgentUsageWidget.swift" \
+        -o "$AX/Contents/MacOS/$WIDGET_NAME" \
+        -framework WidgetKit -framework SwiftUI 2>/dev/null; then
+    codesign --force --sign - --entitlements "$ENT" "$AX" 2>/dev/null || true
+    ok "Widget built — add it from the widget gallery."
+  else
+    warn "Couldn't build the widget extension — the menu-bar app is unaffected."
+    rm -rf "$STAGE/Contents/PlugIns"
+  fi
+  rm -f "$ENT"
+fi
 
 # Ad-hoc signature: enough for a local build, avoids Gatekeeper hassle at launch.
+# Signed last so the embedded extension is sealed into the app's signature.
 codesign --force --sign - "$STAGE" 2>/dev/null || true
 
 # Install into ~/Applications (so it keeps working even if you move/delete this repo).
@@ -95,6 +155,11 @@ rm -rf "$APP"
 mv "$STAGE" "$APP"
 rm -rf "$(dirname "$STAGE")"
 ok "Installed → $APP"
+
+# Tell LaunchServices about the app (and the widget inside it), otherwise the
+# extension never shows up in the widget gallery.
+LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+[ -x "$LSREG" ] && "$LSREG" -f "$APP" 2>/dev/null || true
 
 # ----------------------------------------------------- auto-start at login ---
 say "Enabling auto-start at login…"

@@ -30,6 +30,27 @@ Click them for the full breakdown.
 └────────────────────────────────────┘
 ```
 
+## Notification Centre / desktop widget
+
+Besides the menu bar, the app ships a real **WidgetKit widget**. Add it the usual way —
+right-click the desktop → **Edit Widgets**, or click the clock → scroll down → **Edit Widgets** —
+then look for **Agent Usage** (small and medium sizes).
+
+It is installed automatically by `install.sh`; nothing extra to do.
+
+**How it gets its numbers.** A widget extension is *always sandboxed*, so it cannot run `ccusage`,
+read the keychain, or look inside `~/.codex`. The menu-bar app therefore stays the engine: after
+each successful refresh it writes a small JSON snapshot into the **extension's own container** and
+asks the system to redraw. A sandbox may always read its own container, which is what lets this
+work with a plain ad-hoc signature — an App Group would have required a paid Apple Team ID.
+
+Two consequences worth knowing:
+
+- **The menu-bar app must be running** (it is, at login). If it never ran, the widget says so
+  rather than showing zeros.
+- **The widget is a mirror, not a live view.** macOS budgets widget reloads; the app pushes a
+  refresh whenever it has fresh data, and the widget falls back to a 15-minute timer.
+
 ## What the menu bar shows
 
 The dropdown always lists **both** providers. The bar itself is yours to choose, from the
