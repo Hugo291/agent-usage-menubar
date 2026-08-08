@@ -99,6 +99,7 @@ swiftc -O -swift-version 5 \
 # why no App Group (and therefore no paid Apple Team ID) is needed.
 if [ -f "$SRC_DIR/AgentUsageWidget.swift" ]; then
   say "Building the Notification Centre widget…"
+  SDK_VER="$(xcrun --show-sdk-version 2>/dev/null || sw_vers -productVersion | cut -d. -f1-2)"
   AX="$STAGE/Contents/PlugIns/$WIDGET_NAME.appex"
   mkdir -p "$AX/Contents/MacOS"
   cat > "$AX/Contents/Info.plist" <<AXPLIST
@@ -109,9 +110,18 @@ if [ -f "$SRC_DIR/AgentUsageWidget.swift" ]; then
     <key>CFBundleExecutable</key><string>$WIDGET_NAME</string>
     <key>CFBundleIdentifier</key><string>$WIDGET_ID</string>
     <key>CFBundleName</key><string>$WIDGET_NAME</string>
+    <key>CFBundleDisplayName</key><string>Agent Usage</string>
     <key>CFBundlePackageType</key><string>XPC!</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <!-- Keys Xcode would normally stamp. chronod (the daemon that fills the widget
+         gallery) filters on the platform, so a hand-rolled bundle that omits them
+         registers with pluginkit yet never reaches the gallery. -->
+    <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+    <key>DTPlatformName</key><string>macosx</string>
+    <key>DTSDKName</key><string>macosx$SDK_VER</string>
+    <key>DTPlatformVersion</key><string>$SDK_VER</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSExtension</key>
     <dict>
@@ -131,10 +141,16 @@ AXPLIST
 </dict>
 </plist>
 ENTPLIST
+  # `-e _NSExtensionMain` is what makes this an app extension rather than a program.
+  # Xcode passes it for every extension target; without it the Swift `@main` entry
+  # point runs instead, boots down the ExtensionKit path, returns, and the process
+  # simply exits — so chronod's `getAllDescriptors` dies on an invalidated connection
+  # and the widget never appears, even though pluginkit lists it as registered.
   if swiftc -O -swift-version 5 -parse-as-library \
         "$SRC_DIR/AgentUsageWidget.swift" \
         -o "$AX/Contents/MacOS/$WIDGET_NAME" \
-        -framework WidgetKit -framework SwiftUI 2>/dev/null; then
+        -framework WidgetKit -framework SwiftUI \
+        -Xlinker -e -Xlinker _NSExtensionMain 2>/dev/null; then
     codesign --force --sign - --entitlements "$ENT" "$AX" 2>/dev/null || true
     ok "Widget built — add it from the widget gallery."
   else
