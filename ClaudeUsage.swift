@@ -80,6 +80,59 @@ enum TokenBreakdownPref {
     static func toggle() { set(!enabled) }
 }
 
+// MARK: - Ventilation du coût par type de token
+
+/// Où part l'argent, en dollars par type de token. Partagé par le menu déroulant
+/// (infobulle + lignes) ET par le widget WidgetKit — une seule source de vérité.
+///
+/// On ne code AUCUN prix en dur : on répartit un coût TOTAL déjà connu (celui de
+/// `ccusage`) au prorata des rapports de prix. Les lignes somment donc toujours
+/// exactement au total affiché, même quand les tarifs changent.
+enum Breakdown {
+    typealias Split = (label: String, dollars: Double, tokens: Double)
+
+    private static func split(total: Double,
+                              _ rows: [(label: String, tokens: Double, weight: Double)]) -> [Split]? {
+        let W = rows.reduce(0.0) { $0 + $1.weight }
+        guard total > 0, W > 0 else { return nil }
+        return rows.sorted { $0.weight > $1.weight }.map {
+            (label: $0.label, dollars: total * $0.weight / W, tokens: $0.tokens)
+        }
+    }
+
+    /// Claude : rapports Anthropic IDENTIQUES sur tous les modèles (output 5×,
+    /// cache-write 1,25×, cache-read 0,1× l'input) → répartition exacte.
+    static func claude(_ u: Usage) -> [Split]? {
+        guard let i = u.todayInput, let o = u.todayOutput,
+              let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
+              let total = u.todayCost else { return nil }
+        return split(total: total, [
+            (I18n.t("cache read", "cache read"),   cr, cr * 0.1),
+            (I18n.t("cache write", "cache write"), cw, cw * 1.25),
+            (I18n.t("output", "output"),            o, o * 5),
+            (I18n.t("input", "input"),              i, i * 1),
+        ])
+    }
+
+    /// Codex : 3 postes seulement. Le cache read vaut 0,1× l'input sur toute la famille
+    /// GPT-5 ; le rapport output/input dépend de la génération (cf. `Ccusage.outputRatio`).
+    /// PAS de poste « cache write » : Codex loggue bien un `cache_write_input_tokens`,
+    /// mais (a) il vaut 0 sur tout l'historique local, et (b) le parseur Codex de ccusage
+    /// ne le lit même pas → aucun coût d'écriture n'entre dans le total qu'on répartit.
+    /// Si OpenAI se met à le facturer, c'est le TOTAL de ccusage qui sera incomplet ; la
+    /// répartition ci-dessous, elle, restera cohérente (les lignes somment au total).
+    static func codex(_ u: Usage) -> [Split]? {
+        guard let i = u.codexTodayInput, let o = u.codexTodayOutput,
+              let cr = u.codexTodayCacheRead, let total = u.codexTodayCost else { return nil }
+        let m = u.codexOutputRatio ?? 6
+        return split(total: total, [
+            (I18n.t("cache read", "cache read"), cr, cr * 0.1),
+            (I18n.t("output", "output"),          o, o * m),
+            (I18n.t("input", "input"),            i, i * 1),
+        ])
+    }
+}
+
 // MARK: - Alimentation du widget WidgetKit
 
 /// Le widget du Centre de notifications est une extension EN BAC À SABLE : elle ne
@@ -131,6 +184,13 @@ enum WidgetFeed {
         put("codexAsOf", u.codexAsOf?.timeIntervalSince1970)
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
+        // Ventilation par type de token, déjà calculée et localisée ici : l'extension
+        // n'a ni les tarifs ni le mix de modèles pour la refaire de son côté.
+        func rows(_ b: [Breakdown.Split]?) -> [[String: Any]]? {
+            b.map { $0.map { ["label": $0.label, "dollars": $0.dollars, "tokens": $0.tokens] } }
+        }
+        if let r = rows(Breakdown.claude(u)) { d["claudeSplit"] = r }
+        if let r = rows(Breakdown.codex(u))  { d["codexSplit"]  = r }
 
         guard let data = try? JSONSerialization.data(withJSONObject: d) else { return }
         try? data.write(to: url, options: .atomic)
@@ -1255,49 +1315,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// dollars. Les ratios de prix Anthropic (output 5×, cache-write 1,25×, cache-read
     /// 0,1× l'input) sont IDENTIQUES pour tous les modèles → on peut répartir le coût
     /// total connu par type sans coder de prix en dur ni connaître le mix de modèles.
-    private typealias Split = (label: String, dollars: Double, tokens: Double)
+    private typealias Split = Breakdown.Split
 
-    /// Répartit un coût TOTAL connu entre types de tokens, à partir des seuls rapports
-    /// de prix (pas de prix en dur, donc pas de dérive quand les tarifs changent).
-    private func split(total: Double, _ rows: [(label: String, tokens: Double, weight: Double)]) -> [Split]? {
-        let W = rows.reduce(0.0) { $0 + $1.weight }
-        guard total > 0, W > 0 else { return nil }
-        return rows.sorted { $0.weight > $1.weight }.map {
-            (label: $0.label, dollars: total * $0.weight / W, tokens: $0.tokens)
-        }
-    }
-
-    /// Claude : rapports Anthropic IDENTIQUES sur tous les modèles (output 5×,
-    /// cache-write 1,25×, cache-read 0,1× l'input) → répartition exacte.
-    private func claudeBreakdown(_ u: Usage) -> [Split]? {
-        guard let i = u.todayInput, let o = u.todayOutput,
-              let cw = u.todayCacheWrite, let cr = u.todayCacheRead,
-              let total = u.todayCost else { return nil }
-        return split(total: total, [
-            (I18n.t("cache read", "cache read"),   cr, cr * 0.1),
-            (I18n.t("cache write", "cache write"), cw, cw * 1.25),
-            (I18n.t("output", "output"),            o, o * 5),
-            (I18n.t("input", "input"),              i, i * 1),
-        ])
-    }
-
-    /// Codex : 3 postes seulement. Le cache read vaut 0,1× l'input sur toute la famille
-    /// GPT-5 ; le rapport output/input dépend de la génération (cf. `Ccusage.outputRatio`).
-    /// PAS de poste « cache write » : Codex loggue bien un `cache_write_input_tokens`,
-    /// mais (a) il vaut 0 sur tout l'historique local, et (b) le parseur Codex de ccusage
-    /// ne le lit même pas → aucun coût d'écriture n'entre dans le total qu'on répartit.
-    /// Si OpenAI se met à le facturer, c'est le TOTAL de ccusage qui sera incomplet ; la
-    /// répartition ci-dessous, elle, restera cohérente (les lignes somment au total).
-    private func codexBreakdown(_ u: Usage) -> [Split]? {
-        guard let i = u.codexTodayInput, let o = u.codexTodayOutput,
-              let cr = u.codexTodayCacheRead, let total = u.codexTodayCost else { return nil }
-        let m = u.codexOutputRatio ?? 6
-        return split(total: total, [
-            (I18n.t("cache read", "cache read"), cr, cr * 0.1),
-            (I18n.t("output", "output"),          o, o * m),
-            (I18n.t("input", "input"),            i, i * 1),
-        ])
-    }
+    private func claudeBreakdown(_ u: Usage) -> [Split]? { Breakdown.claude(u) }
+    private func codexBreakdown(_ u: Usage) -> [Split]? { Breakdown.codex(u) }
 
     /// Même ventilation, en texte multi-ligne pour l'infobulle du coût.
     private func costTooltip(_ rows: [Split]?, provider: String, total: Double?) -> String? {

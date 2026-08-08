@@ -32,9 +32,16 @@ Click them for the full breakdown.
 
 ## Notification Centre / desktop widget
 
-Besides the menu bar, the app ships a real **WidgetKit widget**. Add it the usual way —
-right-click the desktop → **Edit Widgets**, or click the clock → scroll down → **Edit Widgets** —
-then look for **Agent Usage** (small and medium sizes).
+Besides the menu bar, the app ships two real **WidgetKit widgets**. Add them the usual way —
+right-click the desktop → **Edit Widgets**, or click the clock → scroll down → **Edit Widgets**:
+
+| Widget | Shows | Sizes |
+|---|---|---|
+| **Agent Usage** | Claude + Codex quotas, today's cost, projection | small, medium |
+| **Agent Usage — Cost detail** | today's cost **split by token type** (cache read / cache write / output / input), with a proportion bar per row | small, medium, large |
+
+The split is the same one the menu-bar app computes — no prices are hardcoded, a known total is
+divided by price *ratios*, so the rows always add up to the cost shown.
 
 It is installed automatically by `install.sh`; nothing extra to do.
 

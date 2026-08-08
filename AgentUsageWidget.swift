@@ -35,8 +35,18 @@ struct Snapshot: Codable {
     var codexAsOf: Double?
     var totalCost: Double?
     var projectedCost: Double?
+    /// Ventilation du coût du jour par type de token, calculée côté app (elle seule
+    /// connaît les rapports de prix et le mix de modèles).
+    var claudeSplit: [SplitRow]?
+    var codexSplit: [SplitRow]?
 
     var isFrench: Bool { lang == "fr" }
+}
+
+struct SplitRow: Codable {
+    var label: String
+    var dollars: Double
+    var tokens: Double
 }
 
 enum Store {
@@ -253,7 +263,128 @@ struct AgentUsageWidget: Widget {
     }
 }
 
+// MARK: - Variante « détail par type de token »
+
+/// Une ligne de ventilation : libellé + tokens à gauche, dollars à droite, et une
+/// barre de proportion qui montre d'un coup d'œil quel poste mange le budget.
+struct SplitRowView: View {
+    let row: SplitRow
+    let share: Double          // 0–1, part du coût du fournisseur
+    let compact: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 4) {
+                Text(row.label)
+                    .font(.system(size: compact ? 10 : 11))
+                    .lineLimit(1)
+                if !compact {
+                    Text(humanTokens(row.tokens))
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 2)
+                Text(humanCost(row.dollars, decimals: row.dollars < 10 ? 2 : 0))
+                    .font(.system(size: compact ? 10 : 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            GeometryReader { geo in
+                Capsule().fill(.tint.opacity(0.65))
+                    .frame(width: max(1, geo.size.width * CGFloat(share)), height: 3)
+            }
+            .frame(height: 3)
+        }
+    }
+}
+
+/// 1 234 567 → « 1,2 M ». Dupliqué côté extension : elle ne partage pas de code
+/// avec l'app (deux binaires distincts), seulement le format de l'instantané.
+func humanTokens(_ n: Double) -> String {
+    if n >= 1e9 { return String(format: "%.1fB", n / 1e9) }
+    if n >= 1e6 { return String(format: "%.0fM", n / 1e6) }
+    if n >= 1e3 { return String(format: "%.0fk", n / 1e3) }
+    return String(format: "%.0f", n)
+}
+
+struct SplitBlock: View {
+    let name: String
+    let cost: Double?
+    let rows: [SplitRow]
+    let compact: Bool
+
+    var body: some View {
+        let total = rows.reduce(0.0) { $0 + $1.dollars }
+        VStack(alignment: .leading, spacing: compact ? 3 : 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(name).font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 4)
+                Text(humanCost(cost, decimals: (cost ?? 0) < 10 ? 2 : 0))
+                    .font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
+            }
+            ForEach(rows.indices, id: \.self) { i in
+                SplitRowView(row: rows[i],
+                             share: total > 0 ? rows[i].dollars / total : 0,
+                             compact: compact)
+            }
+        }
+    }
+}
+
+struct CostDetailBody: View {
+    @Environment(\.widgetFamily) var family
+    let snap: Snapshot?
+
+    var body: some View {
+        if let s = snap, s.updated > 0, (s.claudeSplit?.isEmpty == false || s.codexSplit?.isEmpty == false) {
+            content(s)
+        } else {
+            VStack(spacing: 4) {
+                Image(systemName: "chart.pie").font(.system(size: 18)).foregroundStyle(.secondary)
+                Text(t(snap ?? Snapshot(), "No cost data", "Pas de données de coût"))
+                    .font(.system(size: 11, weight: .semibold)).multilineTextAlignment(.center)
+                Text(t(snap ?? Snapshot(), "ccusage needed", "ccusage requis"))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ s: Snapshot) -> some View {
+        let compact = (family == .systemSmall)
+        VStack(alignment: .leading, spacing: compact ? 5 : 8) {
+            if let c = s.claudeSplit, !c.isEmpty {
+                // Sur la petite taille, seul Claude tient — c'est le gros du coût.
+                SplitBlock(name: "Claude", cost: s.claudeCost,
+                           rows: compact ? Array(c.prefix(3)) : c, compact: compact)
+            }
+            if !compact, let x = s.codexSplit, !x.isEmpty {
+                SplitBlock(name: "Codex", cost: s.codexCost, rows: x, compact: compact)
+            }
+            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                Text(t(s, "Today", "Aujourd’hui")).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(humanCost(s.totalCost))
+                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+            }
+        }
+    }
+}
+
+struct AgentUsageCostWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "AgentUsageCostWidget", provider: Provider()) { entry in
+            CostDetailBody(snap: entry.snap)
+                .containerBackground(.fill.tertiary, for: .widget)
+        }
+        .configurationDisplayName("Agent Usage — Cost detail")
+        .description("Today's cost split by token type: cache read, cache write, output, input.")
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+    }
+}
+
 @main
 struct AgentUsageWidgetBundle: WidgetBundle {
-    var body: some Widget { AgentUsageWidget() }
+    var body: some Widget {
+        AgentUsageWidget()
+        AgentUsageCostWidget()
+    }
 }

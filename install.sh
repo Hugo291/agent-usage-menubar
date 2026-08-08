@@ -100,6 +100,7 @@ swiftc -O -swift-version 5 \
 if [ -f "$SRC_DIR/AgentUsageWidget.swift" ]; then
   say "Building the Notification Centre widget…"
   SDK_VER="$(xcrun --show-sdk-version 2>/dev/null || sw_vers -productVersion | cut -d. -f1-2)"
+  BUILD_VER="$(date +%Y%m%d%H%M)"
   AX="$STAGE/Contents/PlugIns/$WIDGET_NAME.appex"
   mkdir -p "$AX/Contents/MacOS"
   cat > "$AX/Contents/Info.plist" <<AXPLIST
@@ -113,7 +114,11 @@ if [ -f "$SRC_DIR/AgentUsageWidget.swift" ]; then
     <key>CFBundleDisplayName</key><string>Agent Usage</string>
     <key>CFBundlePackageType</key><string>XPC!</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <!-- Build timestamp, not a constant: chronod caches each extension's widget
+         descriptors and only re-queries when the bundle looks new. With a fixed
+         version, adding or renaming a widget silently keeps the OLD list in the
+         gallery until the cache happens to expire. -->
+    <key>CFBundleVersion</key><string>$BUILD_VER</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <!-- Keys Xcode would normally stamp. chronod (the daemon that fills the widget
          gallery) filters on the platform, so a hand-rolled bundle that omits them
