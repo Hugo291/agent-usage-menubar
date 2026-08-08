@@ -276,22 +276,27 @@ struct SplitRowView: View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 4) {
                 Text(row.label)
-                    .font(.system(size: compact ? 10 : 11))
+                    .font(.system(size: compact ? 9.5 : 11))
                     .lineLimit(1)
+                    .layoutPriority(1)
                 if !compact {
                     Text(humanTokens(row.tokens))
-                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                        .font(.system(size: 9)).foregroundStyle(.tertiary).lineLimit(1)
                 }
                 Spacer(minLength: 2)
                 Text(humanCost(row.dollars, decimals: row.dollars < 10 ? 2 : 0))
-                    .font(.system(size: compact ? 10 : 11, weight: .medium).monospacedDigit())
+                    .font(.system(size: compact ? 9.5 : 11, weight: .medium).monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    // Les colonnes de la taille moyenne sont étroites : mieux vaut
+                    // rétrécir le montant que le tronquer en « $60… ».
+                    .minimumScaleFactor(0.8)
             }
             GeometryReader { geo in
                 Capsule().fill(.tint.opacity(0.65))
-                    .frame(width: max(1, geo.size.width * CGFloat(share)), height: 3)
+                    .frame(width: max(1, geo.size.width * CGFloat(share)), height: 2.5)
             }
-            .frame(height: 3)
+            .frame(height: 2.5)
         }
     }
 }
@@ -313,12 +318,14 @@ struct SplitBlock: View {
 
     var body: some View {
         let total = rows.reduce(0.0) { $0 + $1.dollars }
-        VStack(alignment: .leading, spacing: compact ? 3 : 4) {
+        VStack(alignment: .leading, spacing: compact ? 2.5 : 4) {
             HStack(alignment: .firstTextBaseline) {
-                Text(name).font(.system(size: 12, weight: .semibold))
+                Text(name).font(.system(size: compact ? 11 : 12, weight: .semibold))
+                    .lineLimit(1)
                 Spacer(minLength: 4)
                 Text(humanCost(cost, decimals: (cost ?? 0) < 10 ? 2 : 0))
-                    .font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
+                    .font(.system(size: compact ? 10 : 11).monospacedDigit())
+                    .foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
             }
             ForEach(rows.indices, id: \.self) { i in
                 SplitRowView(row: rows[i],
@@ -347,24 +354,55 @@ struct CostDetailBody: View {
         }
     }
 
+    /// Un widget NE DÉFILE PAS : tout ce qui dépasse est rogné, en-têtes compris. La
+    /// hauteur disponible commande donc la mise en page — la taille moyenne est large
+    /// mais basse, d'où deux colonnes plutôt qu'un empilement.
     @ViewBuilder
     private func content(_ s: Snapshot) -> some View {
-        let compact = (family == .systemSmall)
-        VStack(alignment: .leading, spacing: compact ? 5 : 8) {
-            if let c = s.claudeSplit, !c.isEmpty {
-                // Sur la petite taille, seul Claude tient — c'est le gros du coût.
+        let claude = s.claudeSplit ?? []
+        let codex = s.codexSplit ?? []
+        switch family {
+        case .systemSmall:
+            // Trop étroit pour deux fournisseurs : Claude seul, et ses 3 premiers postes
+            // (le 4e, l'input, pèse quelques centimes).
+            VStack(alignment: .leading, spacing: 4) {
                 SplitBlock(name: "Claude", cost: s.claudeCost,
-                           rows: compact ? Array(c.prefix(3)) : c, compact: compact)
+                           rows: Array(claude.prefix(3)), compact: true)
+                Spacer(minLength: 0)
+                footer(s)
             }
-            if !compact, let x = s.codexSplit, !x.isEmpty {
-                SplitBlock(name: "Codex", cost: s.codexCost, rows: x, compact: compact)
+        case .systemLarge:
+            VStack(alignment: .leading, spacing: 10) {
+                if !claude.isEmpty {
+                    SplitBlock(name: "Claude", cost: s.claudeCost, rows: claude, compact: false)
+                }
+                if !codex.isEmpty {
+                    SplitBlock(name: "Codex", cost: s.codexCost, rows: codex, compact: false)
+                }
+                Spacer(minLength: 0)
+                footer(s)
             }
-            Spacer(minLength: 0)
-            HStack(spacing: 4) {
-                Text(t(s, "Today", "Aujourd’hui")).font(.system(size: 10)).foregroundStyle(.secondary)
-                Text(humanCost(s.totalCost))
-                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+        default:   // systemMedium : deux colonnes, sinon ça déborde en hauteur.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .top, spacing: 14) {
+                    if !claude.isEmpty {
+                        SplitBlock(name: "Claude", cost: s.claudeCost, rows: claude, compact: true)
+                    }
+                    if !codex.isEmpty {
+                        SplitBlock(name: "Codex", cost: s.codexCost, rows: codex, compact: true)
+                    }
+                }
+                Spacer(minLength: 0)
+                footer(s)
             }
+        }
+    }
+
+    private func footer(_ s: Snapshot) -> some View {
+        HStack(spacing: 4) {
+            Text(t(s, "Today", "Aujourd’hui")).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(humanCost(s.totalCost))
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
         }
     }
 }
