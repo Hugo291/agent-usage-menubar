@@ -79,7 +79,10 @@ if [ -z "${SRC_DIR:-}" ] || [ ! -f "$SRC_DIR/ClaudeUsage.swift" ]; then
 fi
 
 # ------------------------------------------------------------------- build ---
-say "Building $APP_NAME…"
+# Braces are load-bearing: macOS ships bash 3.2, where `set -u` plus a UTF-8
+# locale swallows the following multibyte character into the variable name
+# ("APP_NAME…: unbound variable") and aborts the install.
+say "Building ${APP_NAME}…"
 STAGE="$(mktemp -d)/$APP_NAME.app"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC_DIR/Info.plist" "$STAGE/Contents/Info.plist"
