@@ -46,6 +46,7 @@ struct Snapshot: Codable {
     var ollamaWeekReset: Double?
     /// Coût Ollama sur 4 SEMAINES — jamais mêlé aux coûts du jour.
     var ollamaCost4w: Double?
+    var ollamaPlan: String?
 
     var isFrench: Bool { lang == "fr" }
 }
@@ -216,7 +217,7 @@ struct WidgetBody: View {
                 ProviderBlock(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
                               rows: codexRows, snap: s)
                 if !ollamaRows.isEmpty {
-                    ProviderBlock(name: "Ollama", plan: "cloud", cost: nil,
+                    ProviderBlock(name: "Ollama", plan: s.ollamaPlan ?? "cloud", cost: nil,
                                   rows: ollamaRows, snap: s)
                 }
                 Spacer(minLength: 0)

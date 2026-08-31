@@ -149,7 +149,18 @@ Ollama section simply does not appear.
 
 Two windows are shown, **session** and **weekly** — the API reports each as a consumed fraction
 (`usage: 1` means the quota is spent, which is what a `429 … reached your session usage limit`
-looks like from the CLI). It publishes **no reset time**, so those rows have none.
+looks like from the CLI). The account **plan** comes from `POST /api/me`.
+
+**Reset times take some work**, because Ollama publishes none — not in the body, not in the
+response headers, not even on the `429`:
+
+- **Weekly** is derived from `activity.period.starting_at`, which is a week boundary (a Monday
+  00:00 UTC). The widget uses that value as the anchor and steps forward in 7-day jumps, so it
+  reads the anchor *from Ollama* rather than hardcoding a weekday.
+- **Session** has no published duration at all, so the widget **observes** it: it records the
+  consumption at each refresh, treats a sharp drop as a reset, and once it has seen two resets it
+  knows the period and can show the next one. Until then the row simply has no time — nothing is
+  invented.
 
 Ollama's `activity.cost` covers the **last 4 weeks**, not today, so it is labelled as such and is
 never added to the daily total or the projection.

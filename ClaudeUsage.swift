@@ -186,6 +186,7 @@ enum WidgetFeed {
         limit("ollamaSession", u.ollamaSession)
         limit("ollamaWeek", u.ollamaWeekly)
         put("ollamaCost4w", u.ollamaCost4w)
+        put("ollamaPlan", u.ollamaPlan)
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
         // Ventilation par type de token, déjà calculée et localisée ici : l'extension
@@ -251,6 +252,7 @@ struct Usage: Codable {
     /// `ollama.com/api/usage`. Pas d'heure de reset : l'API n'en publie aucune.
     var ollamaSession: Limit?
     var ollamaWeekly: Limit?
+    var ollamaPlan: String?
     /// Coût Ollama sur les 4 DERNIÈRES SEMAINES (c'est la période que l'API renvoie,
     /// pas la journée) → à afficher tel quel, JAMAIS à additionner au total du jour.
     var ollamaCost4w: Double?
@@ -654,6 +656,7 @@ enum Fetcher {
                 u.ollamaSession = ol.session
                 u.ollamaWeekly = ol.weekly
                 u.ollamaCost4w = ol.cost4w
+                u.ollamaPlan = ol.plan
                 dbg("ollama session=\(String(describing: ol.session?.remaining)) hebdo=\(String(describing: ol.weekly?.remaining))")
             }
 
@@ -676,7 +679,7 @@ enum Fetcher {
 ///    "limits":{"session":{"usage":1,…},"weekly":{"usage":0.094,…}}}
 /// `usage` est une FRACTION CONSOMMÉE (0–1), pas un pourcentage : 1 = quota épuisé.
 enum OllamaLimits {
-    struct Reading { var session: Limit?; var weekly: Limit?; var cost4w: Double? }
+    struct Reading { var session: Limit?; var weekly: Limit?; var cost4w: Double?; var plan: String? }
 
     static var keyPath: String { NSHomeDirectory() + "/.ollama/widget-key" }
 
@@ -686,6 +689,31 @@ enum OllamaLimits {
         guard let raw = try? String(contentsOfFile: keyPath, encoding: .utf8) else { return nil }
         let k = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return k.isEmpty ? nil : k
+    }
+
+    /// Plan du compte (`/api/me` → "pro", "free"…). Récupéré une seule fois : il ne
+    /// bouge pas d'un rafraîchissement à l'autre.
+    private static var cachedPlan: String?
+    private static func plan(_ key: String) -> String? {
+        if let p = cachedPlan { return p }
+        guard let url = URL(string: "https://ollama.com/api/me") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.httpBody = Data("{}".utf8)
+        req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 10
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data = data,
+                  let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return }
+            // La clé est capitalisée côté Ollama ("Plan"), pas "plan".
+            cachedPlan = (o["Plan"] as? String)?.lowercased()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 12)
+        return cachedPlan
     }
 
     static func read() -> Reading? {
@@ -719,10 +747,81 @@ enum OllamaLimits {
                 // `cost` arrive en CHAÎNE ("0.00000") — pas en nombre.
                 if let s = act["cost"] as? String { r.cost4w = Double(s) }
                 else if let d = act["cost"] as? Double { r.cost4w = d }
+                // L'API ne donne AUCUNE heure de reset. Mais `period.starting_at` est
+                // une FRONTIÈRE DE SEMAINE (vérifié : un lundi 00:00 UTC) : on s'en
+                // sert d'ancre et on avance de 7 j jusqu'à dépasser maintenant. On lit
+                // ainsi l'ancre chez Ollama plutôt que de coder « lundi » en dur.
+                if let per = act["period"] as? [String: Any],
+                   let anchor = Fetcher.parseDate(per["starting_at"] as? String),
+                   var w = r.weekly {
+                    let week: TimeInterval = 7 * 86_400
+                    let n = max(0, (Date().timeIntervalSince(anchor) / week).rounded(.down) + 1)
+                    w.resetsAt = anchor.addingTimeInterval(n * week)
+                    r.weekly = w
+                }
+            }
+            // Fenêtre « session » : ni durée ni reset publiés. On l'OBSERVE — quand la
+            // consommation retombe, c'est qu'un reset a eu lieu ; deux resets donnent la
+            // période, donc le suivant. Tant qu'on n'a pas vu deux cycles, pas de ligne.
+            if let sess = r.session {
+                r.session = SessionWatcher.track(sess)
             }
             out = (r.session == nil && r.weekly == nil) ? nil : r
         }.resume()
         _ = sem.wait(timeout: .now() + 15)
+        if out != nil { out?.plan = plan(key) }
+        return out
+    }
+}
+
+/// La fenêtre « session » d'Ollama n'a ni durée ni reset publiés (vérifié : absents du
+/// corps, des en-têtes, et même de la réponse 429). On la déduit donc de l'OBSERVATION :
+/// à chaque relevé on note la consommation ; quand elle retombe nettement, c'est un
+/// reset. Deux resets donnent la période, donc la date du suivant. Avant ça, on n'invente
+/// rien — la ligne reste sans heure.
+enum SessionWatcher {
+    struct State: Codable { var lastUsage: Double?; var lastReset: Date?; var period: TimeInterval? }
+
+    private static var url: URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.hugo.claudeusagewidget", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("ollama-session.json")
+    }
+
+    private static func load() -> State {
+        guard let d = try? Data(contentsOf: url) else { return State() }
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+        return (try? dec.decode(State.self, from: d)) ?? State()
+    }
+
+    private static func save(_ st: State) {
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        try? enc.encode(st).write(to: url, options: .atomic)
+    }
+
+    static func track(_ limit: Limit) -> Limit {
+        var st = load()
+        var out = limit
+        let now = Date()
+        // Une BAISSE franche de la consommation = la fenêtre a été remise à zéro.
+        // Le seuil évite de prendre du bruit d'arrondi pour un reset.
+        if let prev = st.lastUsage, limit.utilization < prev - 5 {
+            if let previousReset = st.lastReset {
+                let delta = now.timeIntervalSince(previousReset)
+                if delta > 600 { st.period = delta }   // ignore deux relevés collés
+            }
+            st.lastReset = now
+        } else if st.lastReset == nil {
+            st.lastReset = now   // première observation : point de départ
+        }
+        st.lastUsage = limit.utilization
+        save(st)
+        if let last = st.lastReset, let p = st.period {
+            var next = last.addingTimeInterval(p)
+            while next < now { next = next.addingTimeInterval(p) }
+            out.resetsAt = next
+        }
         return out
     }
 }
@@ -1622,7 +1721,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (sinon on n'a rien à montrer). Pas de ligne de reset : l'API n'en publie pas.
     private func ollamaItems(_ u: Usage) -> [NSMenuItem] {
         guard u.ollamaSession != nil || u.ollamaWeekly != nil else { return [] }
-        var items: [NSMenuItem] = [providerHeader("Ollama · cloud", cost: nil)]
+        let name = u.ollamaPlan.map { "Ollama · \($0)" } ?? "Ollama · cloud"
+        var items: [NSMenuItem] = [providerHeader(name, cost: nil)]
         if u.ollamaSession != nil {
             items += compactQuota(symbol: "bolt", label: I18n.t("session", "session"),
                                   limit: u.ollamaSession)
@@ -1749,7 +1849,7 @@ func printUsage(_ u: Usage) {
     if u.codexSevenDay != nil { line("Codex hebdo ", u.codexSevenDay) }
     if let asOf = u.codexAsOf { print("Codex relevé: \(UI.agoText(asOf))") }
     if u.ollamaSession != nil || u.ollamaWeekly != nil {
-        print("— Ollama Cloud —")
+        print("— Ollama Cloud" + (u.ollamaPlan.map { " (plan \($0))" } ?? "") + " —")
         line("Session     ", u.ollamaSession)
         line("Hebdo       ", u.ollamaWeekly)
         if let c = u.ollamaCost4w { print("Ollama (4 sem.): \(UI.humanCost(c, decimals: 2))") }
