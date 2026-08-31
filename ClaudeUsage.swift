@@ -37,7 +37,7 @@ enum I18n {
 /// toujours les deux). Pratique quand l'un des deux est à sec : on bascule sur
 /// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
 enum BarProvider: String, CaseIterable {
-    case claude, codex
+    case claude, codex, ollama
     /// Cumul : la barre ne montre que le coût TOTAL du jour (Claude + Codex). Les
     /// pourcentages, eux, ne se cumulent pas (deux ressources distinctes : 70 % de
     /// Claude + 78 % de Codex ne veut rien dire) → ils restent dans le menu déroulant.
@@ -48,6 +48,7 @@ enum BarProvider: String, CaseIterable {
         switch self {
         case .claude: return "Claude"
         case .codex:  return "Codex"
+        case .ollama: return "Ollama"
         case .total:  return I18n.t("Total cost", "Coût cumulé")
         }
     }
@@ -182,6 +183,9 @@ enum WidgetFeed {
         limit("codexWeek", u.codexSevenDay)
         put("codexCost", u.codexTodayCost)
         put("codexAsOf", u.codexAsOf?.timeIntervalSince1970)
+        limit("ollamaSession", u.ollamaSession)
+        limit("ollamaWeek", u.ollamaWeekly)
+        put("ollamaCost4w", u.ollamaCost4w)
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
         // Ventilation par type de token, déjà calculée et localisée ici : l'extension
@@ -242,6 +246,14 @@ struct Usage: Codable {
     var codexPlan: String?
     /// Horodatage du dernier relevé Codex (pour afficher son âge / sa péremption).
     var codexAsOf: Date?
+
+    /// Quotas Ollama Cloud (fenêtres « session » et « weekly »), lus sur
+    /// `ollama.com/api/usage`. Pas d'heure de reset : l'API n'en publie aucune.
+    var ollamaSession: Limit?
+    var ollamaWeekly: Limit?
+    /// Coût Ollama sur les 4 DERNIÈRES SEMAINES (c'est la période que l'API renvoie,
+    /// pas la journée) → à afficher tel quel, JAMAIS à additionner au total du jour.
+    var ollamaCost4w: Double?
 
     /// Coût total du jour, toutes sources confondues (Claude + Codex).
     var totalTodayCost: Double? {
@@ -637,8 +649,81 @@ enum Fetcher {
             u.codexAsOf = cl.asOf
             dbg("codex quotas 5h=\(String(describing: cl.fiveHour?.remaining)) hebdo=\(String(describing: cl.sevenDay?.remaining)) plan=\(String(describing: cl.plan))")
 
+            // Quotas Ollama Cloud (optionnels : seulement si une clé est configurée).
+            if let ol = OllamaLimits.read() {
+                u.ollamaSession = ol.session
+                u.ollamaWeekly = ol.weekly
+                u.ollamaCost4w = ol.cost4w
+                dbg("ollama session=\(String(describing: ol.session?.remaining)) hebdo=\(String(describing: ol.weekly?.remaining))")
+            }
+
             done(.ok(u))
         }
+    }
+}
+
+// MARK: - Quotas Ollama Cloud
+
+/// Ollama Cloud publie ses quotas sur `GET https://ollama.com/api/usage`. Contrairement
+/// à Codex il n'y a AUCUNE trace locale à lire (la base de l'app ne contient que des
+/// conversations), et contrairement à Claude on ne peut pas réutiliser une session
+/// existante : la signature Ed25519 du CLI ne vaut que pour le registre. Il faut donc
+/// une clé API, que l'utilisateur crée lui-même sur ollama.com/settings/keys et dépose
+/// dans `~/.ollama/widget-key`. Sans ce fichier, la section n'est simplement pas affichée.
+///
+/// Forme de la réponse (vérifiée le 31/08/2026) :
+///   {"activity":{"cost":"0.00000","period":{"type":"last_4_weeks",…}},
+///    "limits":{"session":{"usage":1,…},"weekly":{"usage":0.094,…}}}
+/// `usage` est une FRACTION CONSOMMÉE (0–1), pas un pourcentage : 1 = quota épuisé.
+enum OllamaLimits {
+    struct Reading { var session: Limit?; var weekly: Limit?; var cost4w: Double? }
+
+    static var keyPath: String { NSHomeDirectory() + "/.ollama/widget-key" }
+
+    /// Clé lue à chaque appel (et jamais journalisée) : ainsi une clé révoquée puis
+    /// remplacée est prise en compte sans redémarrer le widget.
+    private static func apiKey() -> String? {
+        guard let raw = try? String(contentsOfFile: keyPath, encoding: .utf8) else { return nil }
+        let k = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return k.isEmpty ? nil : k
+    }
+
+    static func read() -> Reading? {
+        guard let key = apiKey(),
+              let url = URL(string: "https://ollama.com/api/usage") else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 12
+
+        var out: Reading?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200, let data = data,
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else {
+                // 401 = clé invalide/révoquée. On n'affiche rien plutôt que des zéros.
+                Fetcher.dbg("ollama /api/usage → HTTP \(code)")
+                return
+            }
+            func window(_ name: String) -> Limit? {
+                guard let lim = root["limits"] as? [String: Any],
+                      let w = lim[name] as? [String: Any],
+                      let used = w["usage"] as? Double else { return nil }
+                // fraction consommée → pourcentage d'utilisation, borné.
+                return Limit(utilization: max(0, min(1, used)) * 100, resetsAt: nil)
+            }
+            var r = Reading(session: window("session"), weekly: window("weekly"), cost4w: nil)
+            if let act = root["activity"] as? [String: Any] {
+                // `cost` arrive en CHAÎNE ("0.00000") — pas en nombre.
+                if let s = act["cost"] as? String { r.cost4w = Double(s) }
+                else if let d = act["cost"] as? Double { r.cost4w = d }
+            }
+            out = (r.session == nil && r.weekly == nil) ? nil : r
+        }.resume()
+        _ = sem.wait(timeout: .now() + 15)
+        return out
     }
 }
 
@@ -1222,6 +1307,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .codex:
             codexSegments()
             cost = usage.codexTodayCost
+        case .ollama:
+            // Le coût Ollama porte sur 4 semaines, pas sur la journée : on n'en met
+            // AUCUN dans la barre, qui parle du jour partout ailleurs.
+            if usage.ollamaSession != nil {
+                segment(symbol: "bolt", fallback: "ses", limit: usage.ollamaSession)
+                gap()
+            }
+            segment(symbol: "calendar", fallback: "7j", limit: usage.ollamaWeekly)
+            cost = nil
         case .total:
             cost = usage.totalTodayCost   // pas de quotas : seul l'argent s'additionne
         }
@@ -1524,6 +1618,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
+    /// Section Ollama Cloud : affichée UNIQUEMENT si une clé API est configurée
+    /// (sinon on n'a rien à montrer). Pas de ligne de reset : l'API n'en publie pas.
+    private func ollamaItems(_ u: Usage) -> [NSMenuItem] {
+        guard u.ollamaSession != nil || u.ollamaWeekly != nil else { return [] }
+        var items: [NSMenuItem] = [providerHeader("Ollama · cloud", cost: nil)]
+        if u.ollamaSession != nil {
+            items += compactQuota(symbol: "bolt", label: I18n.t("session", "session"),
+                                  limit: u.ollamaSession)
+        }
+        if u.ollamaWeekly != nil {
+            items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"),
+                                  limit: u.ollamaWeekly)
+        }
+        // Le coût Ollama porte sur 4 SEMAINES : on l'étiquette explicitement pour qu'il
+        // ne se confonde pas avec les coûts du JOUR affichés au-dessus, et on ne
+        // l'additionne nulle part.
+        if let c = u.ollamaCost4w, c > 0 {
+            items.append(displayItem(NSAttributedString(
+                string: I18n.t("\(UI.humanCost(c, decimals: 2)) over 4 weeks",
+                               "\(UI.humanCost(c, decimals: 2)) sur 4 semaines"),
+                attributes: [.font: NSFont.systemFont(ofSize: 10),
+                             .foregroundColor: NSColor.tertiaryLabelColor]), indent: 16))
+        }
+        return items
+    }
+
     func rebuildMenu(usage: Usage? = nil, loadingMessage: String? = nil,
                      errorMessage: String? = nil, noticeMessage: String? = nil,
                      offlineCost: Double? = nil) {
@@ -1555,6 +1675,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for item in claudeItems(u) { menu.addItem(item) }
             menu.addItem(.separator())
             for item in codexItems(u) { menu.addItem(item) }
+            let ollama = ollamaItems(u)
+            if !ollama.isEmpty {
+                menu.addItem(.separator())
+                for item in ollama { menu.addItem(item) }
+            }
             // Pied : coût total du jour (Claude + Codex) + projection.
             if let total = u.totalTodayCost {
                 menu.addItem(.separator())
@@ -1602,10 +1727,13 @@ func printUsage(_ u: Usage) {
     func pct(_ l: Limit?) -> String { l.map { String(format: "%.0f%%", $0.remaining) } ?? "—" }
     let claudeBar = "5h \(pct(u.fiveHour))  ·  7j \(pct(u.sevenDay))"
     let codexBar = (u.codexFiveHour.map { "5h \(pct($0))  ·  " } ?? "") + "7j \(pct(u.codexSevenDay))"
+    let ollamaBar = (u.ollamaSession.map { _ in "ses \(pct(u.ollamaSession))  ·  " } ?? "")
+        + "7j \(pct(u.ollamaWeekly))"
     let (barBody, barCost): (String, Double?) = {
         switch BarPref.current {
         case .claude: return (claudeBar, u.todayCost)
         case .codex:  return (codexBar, u.codexTodayCost)
+        case .ollama: return (ollamaBar, nil)
         case .total:  return ("", u.totalTodayCost)
         }
     }()
@@ -1620,6 +1748,12 @@ func printUsage(_ u: Usage) {
     if u.codexFiveHour != nil { line("Codex 5 h   ", u.codexFiveHour) }
     if u.codexSevenDay != nil { line("Codex hebdo ", u.codexSevenDay) }
     if let asOf = u.codexAsOf { print("Codex relevé: \(UI.agoText(asOf))") }
+    if u.ollamaSession != nil || u.ollamaWeekly != nil {
+        print("— Ollama Cloud —")
+        line("Session     ", u.ollamaSession)
+        line("Hebdo       ", u.ollamaWeekly)
+        if let c = u.ollamaCost4w { print("Ollama (4 sem.): \(UI.humanCost(c, decimals: 2))") }
+    }
     if let cc = u.codexTodayCost, let ct = u.codexTodayTokens {
         print("Codex (jour): \(UI.humanCost(cc, decimals: 2)) · \(UI.humanTokens(ct)) tokens")
         if let i = u.codexTodayInput, let o = u.codexTodayOutput, let cr = u.codexTodayCacheRead, cc > 0 {

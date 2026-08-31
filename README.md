@@ -133,6 +133,27 @@ on Codex versions that still log them, the `X-Codex-*` response headers in
 updates when Codex makes a call), the widget shows the **age of the last reading** ("last
 reading X ago") so you know the figures are from your last Codex call, not real time.
 
+### Ollama Cloud — opt-in, needs an API key
+Ollama Cloud publishes its quota at `GET https://ollama.com/api/usage`, and nothing else works:
+there is no local trace to read (the desktop app's database only holds conversations), and the
+CLI's Ed25519 signature is only good for the model registry. So this section is **off unless you
+opt in**:
+
+```bash
+# create a key at https://ollama.com/settings/keys, then:
+printf '%s' 'YOUR_KEY' > ~/.ollama/widget-key && chmod 600 ~/.ollama/widget-key
+```
+
+The widget reads that file at each refresh and never writes the key anywhere. With no file, the
+Ollama section simply does not appear.
+
+Two windows are shown, **session** and **weekly** — the API reports each as a consumed fraction
+(`usage: 1` means the quota is spent, which is what a `429 … reached your session usage limit`
+looks like from the CLI). It publishes **no reset time**, so those rows have none.
+
+Ollama's `activity.cost` covers the **last 4 weeks**, not today, so it is labelled as such and is
+never added to the daily total or the projection.
+
 ### Cost & tokens
 `ccusage claude daily` (Claude only — not the agent-wide `ccusage daily`, which would fold in
 Codex and others) and `ccusage codex daily` (Codex) provide today's cost and token counts. Each

@@ -39,6 +39,13 @@ struct Snapshot: Codable {
     /// connaît les rapports de prix et le mix de modèles).
     var claudeSplit: [SplitRow]?
     var codexSplit: [SplitRow]?
+    /// Ollama Cloud : deux fenêtres, sans heure de reset (l'API n'en publie pas).
+    var ollamaSession: Double?
+    var ollamaSessionReset: Double?
+    var ollamaWeek: Double?
+    var ollamaWeekReset: Double?
+    /// Coût Ollama sur 4 SEMAINES — jamais mêlé aux coûts du jour.
+    var ollamaCost4w: Double?
 
     var isFrench: Bool { lang == "fr" }
 }
@@ -190,9 +197,31 @@ struct WidgetBody: View {
         return r
     }
 
+    private var ollamaRows: [(String, Double?, Double?)] {
+        guard let s = snap else { return [] }
+        var r: [(String, Double?, Double?)] = []
+        if s.ollamaSession != nil { r.append((t(s, "session", "session"), s.ollamaSession, s.ollamaSessionReset)) }
+        if s.ollamaWeek != nil { r.append((t(s, "week", "hebdo"), s.ollamaWeek, s.ollamaWeekReset)) }
+        return r
+    }
+
     @ViewBuilder
     private func content(_ s: Snapshot) -> some View {
         switch family {
+        case .systemLarge:
+            // Seule taille assez HAUTE pour les trois fournisseurs empilés.
+            VStack(alignment: .leading, spacing: 10) {
+                ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
+                              rows: claudeRows, snap: s)
+                ProviderBlock(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
+                              rows: codexRows, snap: s)
+                if !ollamaRows.isEmpty {
+                    ProviderBlock(name: "Ollama", plan: "cloud", cost: nil,
+                                  rows: ollamaRows, snap: s)
+                }
+                Spacer(minLength: 0)
+                footer(s)
+            }
         case .systemSmall:
             // Petit : Claude seul (le plus contraint en pratique) + coût total.
             VStack(alignment: .leading, spacing: 6) {
@@ -258,8 +287,8 @@ struct AgentUsageWidget: Widget {
                 .containerBackground(.fill.tertiary, for: .widget)
         }
         .configurationDisplayName("Agent Usage")
-        .description("Claude and Codex quotas and today's cost.")
-        .supportedFamilies([.systemSmall, .systemMedium])
+        .description("Claude, Codex and Ollama quotas, and today's cost.")
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
 
