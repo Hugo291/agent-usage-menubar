@@ -278,9 +278,12 @@ struct WidgetBody: View {
                     ProviderBlock(name: "Ollama", plan: s.ollamaPlan ?? "cloud", cost: nil,
                                   rows: ollamaRows(s), snap: s)
                 }
-                Spacer(minLength: 2)
-                TokenShareBar(snap: s)
+                // Le Spacer était AVANT le graphe : il absorbait tout l'espace libre
+                // et creusait un grand vide sous les quotas. Placé après le pied, le
+                // contenu reste groupé en haut et le surplus retombe en bas.
+                TokenShareBar(snap: s).padding(.top, 2)
                 footer(s)
+                Spacer(minLength: 0)
             }
         case .systemSmall:
             VStack(alignment: .leading, spacing: 5) {
