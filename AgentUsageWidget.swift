@@ -97,46 +97,53 @@ func resetText(_ epoch: Double?, _ s: Snapshot) -> String? {
     let secs = e - Date().timeIntervalSince1970
     guard secs > 0 else { return nil }
     let h = Int(secs / 3600), m = Int(secs / 60) % 60
-    if h >= 1 { return t(s, "in \(h) h", "dans \(h) h") }
-    return t(s, "in \(m) min", "dans \(m) min")
+    // Format court : la colonne fait 42 pt, « dans 145 h » n'y tient pas.
+    if h >= 1 { return "↻ \(h) h" }
+    return "↻ \(m) min"
 }
 
-/// Une ligne de quota : libellé, barre fine, pourcentage restant.
-struct QuotaRow: View {
+/// Une fenêtre de quota, sur UNE SEULE LIGNE : libellé · barre · % · reset.
+/// Le reset était auparavant sur sa propre ligne : à trois fournisseurs, la grande
+/// taille dépassait les ~300 pt utiles et le haut du widget était rogné (l'en-tête
+/// « Claude » disparaissait). Tout ramener sur une ligne fait gagner ~11 pt par
+/// quota, soit assez pour que tout tienne.
+struct QuotaLine: View {
     let label: String
     let remaining: Double?
     let reset: Double?
     let snap: Snapshot
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Text(label)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Text(remaining.map { String(format: "%.0f%%", $0) } ?? "—")
-                    .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    .foregroundStyle(remaining.map { color(forRemaining: $0) } ?? .secondary)
-            }
+        let c = remaining.map { color(forRemaining: $0) } ?? .secondary
+        HStack(spacing: 7) {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 46, alignment: .leading)
+                .lineLimit(1)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary).frame(height: 4)
-                    Capsule()
-                        .fill(color(forRemaining: remaining ?? 0))
-                        .frame(width: geo.size.width * CGFloat(max(0, min(100, remaining ?? 0)) / 100),
-                               height: 4)
+                    Capsule().fill(.quaternary)
+                    Capsule().fill(c)
+                        .frame(width: geo.size.width * CGFloat(max(0, min(100, remaining ?? 0)) / 100))
                 }
             }
             .frame(height: 4)
-            if let r = resetText(reset, snap) {
-                Text(r).font(.system(size: 9)).foregroundStyle(.tertiary)
-            }
+            Text(remaining.map { String(format: "%.0f%%", $0) } ?? "—")
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                .foregroundStyle(c)
+                .frame(width: 36, alignment: .trailing)
+            Text(resetText(reset, snap) ?? "")
+                .font(.system(size: 9).monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .frame(width: 42, alignment: .trailing)
+                .lineLimit(1)
         }
+        .frame(height: 15)
     }
 }
 
-/// Un fournisseur : nom + plan à gauche, coût du jour à droite, puis ses fenêtres.
+/// Un fournisseur : en-tête (nom · plan, coût à droite) puis ses fenêtres.
 struct ProviderBlock: View {
     let name: String
     let plan: String?
@@ -145,30 +152,37 @@ struct ProviderBlock: View {
     let snap: Snapshot
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(plan.map { "\(name) · \($0)" } ?? name)
-                    .font(.system(size: 12, weight: .semibold))
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(name).font(.system(size: 12, weight: .semibold))
+                if let p = plan {
+                    Text(p).font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
                 Spacer(minLength: 4)
-                Text(humanCost(cost, decimals: cost.map { $0 < 10 } == true ? 2 : 0))
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                // Rien plutôt qu'un « — » : Ollama ne publie pas de coût du jour, et
+                // un tiret dans la colonne des dollars se lisait comme une panne.
+                if let c = cost {
+                    Text(humanCost(c, decimals: c < 10 ? 2 : 0))
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             if rows.isEmpty {
                 Text(t(snap, "no quota data", "pas de quota"))
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
             } else {
                 ForEach(rows.indices, id: \.self) { i in
-                    QuotaRow(label: rows[i].0, remaining: rows[i].1, reset: rows[i].2, snap: snap)
+                    QuotaLine(label: rows[i].0, remaining: rows[i].1,
+                              reset: rows[i].2, snap: snap)
                 }
             }
         }
     }
 }
 
-/// Répartition des tokens du jour entre fournisseurs : une barre empilée + une
-/// légende. Réservée aux tailles où il reste de la place (un widget ne défile pas).
-/// Ollama n'y figure pas — son API ne publie pas de tokens, seulement des requêtes.
+/// Répartition des tokens du jour entre fournisseurs : barre empilée + légende.
+/// Réservée aux tailles où il reste de la place (un widget ne défile pas). Ollama
+/// n'y figure pas — son API ne publie pas de tokens, seulement des requêtes.
 struct TokenShareBar: View {
     let snap: Snapshot
 
@@ -182,19 +196,19 @@ struct TokenShareBar: View {
     var body: some View {
         let total = parts.reduce(0.0) { $0 + $1.tokens }
         if total > 0 {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(t(snap, "Tokens today", "Tokens du jour"))
-                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                    .font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
                 GeometryReader { geo in
-                    HStack(spacing: 1) {
+                    HStack(spacing: 1.5) {
                         ForEach(parts.indices, id: \.self) { i in
                             Capsule().fill(parts[i].color)
-                                .frame(width: max(2, (geo.size.width - 1) * CGFloat(parts[i].tokens / total)))
+                                .frame(width: max(3, (geo.size.width - 3) * CGFloat(parts[i].tokens / total)))
                         }
                     }
                 }
-                .frame(height: 7)
-                HStack(spacing: 8) {
+                .frame(height: 6)
+                HStack(spacing: 10) {
                     ForEach(parts.indices, id: \.self) { i in
                         HStack(spacing: 3) {
                             Circle().fill(parts[i].color).frame(width: 5, height: 5)
@@ -220,8 +234,6 @@ struct WidgetBody: View {
         if let s = snap, s.updated > 0 {
             content(s)
         } else {
-            // Pas encore d'instantané : l'app de barre de menus ne tourne pas, ou
-            // n'a pas encore écrit. On le dit plutôt que d'afficher des zéros.
             VStack(spacing: 4) {
                 Image(systemName: "menubar.arrow.up.rectangle")
                     .font(.system(size: 18)).foregroundStyle(.secondary)
@@ -232,65 +244,58 @@ struct WidgetBody: View {
         }
     }
 
-    private var claudeRows: [(String, Double?, Double?)] {
-        guard let s = snap else { return [] }
-        var r: [(String, Double?, Double?)] = []
-        if s.claudeFiveHour != nil { r.append((t(s, "5h", "5h"), s.claudeFiveHour, s.claudeFiveHourReset)) }
-        if s.claudeWeek != nil { r.append((t(s, "week", "hebdo"), s.claudeWeek, s.claudeWeekReset)) }
-        return r
+    private func rows(_ pairs: [(String, Double?, Double?)]) -> [(String, Double?, Double?)] {
+        pairs.filter { $0.1 != nil }
     }
 
-    private var codexRows: [(String, Double?, Double?)] {
-        guard let s = snap else { return [] }
-        var r: [(String, Double?, Double?)] = []
-        if s.codexFiveHour != nil { r.append((t(s, "5h", "5h"), s.codexFiveHour, s.codexFiveHourReset)) }
-        if s.codexWeek != nil { r.append((t(s, "week", "hebdo"), s.codexWeek, s.codexWeekReset)) }
-        return r
+    private func claudeRows(_ s: Snapshot) -> [(String, Double?, Double?)] {
+        rows([(t(s, "5h", "5h"), s.claudeFiveHour, s.claudeFiveHourReset),
+              (t(s, "week", "hebdo"), s.claudeWeek, s.claudeWeekReset)])
     }
 
-    private var ollamaRows: [(String, Double?, Double?)] {
-        guard let s = snap else { return [] }
-        var r: [(String, Double?, Double?)] = []
-        if s.ollamaSession != nil { r.append((t(s, "session", "session"), s.ollamaSession, s.ollamaSessionReset)) }
-        if s.ollamaWeek != nil { r.append((t(s, "week", "hebdo"), s.ollamaWeek, s.ollamaWeekReset)) }
-        return r
+    private func codexRows(_ s: Snapshot) -> [(String, Double?, Double?)] {
+        rows([(t(s, "5h", "5h"), s.codexFiveHour, s.codexFiveHourReset),
+              (t(s, "week", "hebdo"), s.codexWeek, s.codexWeekReset)])
+    }
+
+    private func ollamaRows(_ s: Snapshot) -> [(String, Double?, Double?)] {
+        rows([(t(s, "session", "session"), s.ollamaSession, s.ollamaSessionReset),
+              (t(s, "week", "hebdo"), s.ollamaWeek, s.ollamaWeekReset)])
     }
 
     @ViewBuilder
     private func content(_ s: Snapshot) -> some View {
         switch family {
         case .systemLarge:
-            // Seule taille assez HAUTE pour les trois fournisseurs empilés.
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 9) {
                 ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
-                              rows: claudeRows, snap: s)
+                              rows: claudeRows(s), snap: s)
+                Divider().opacity(0.35)
                 ProviderBlock(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
-                              rows: codexRows, snap: s)
-                if !ollamaRows.isEmpty {
+                              rows: codexRows(s), snap: s)
+                if !ollamaRows(s).isEmpty {
+                    Divider().opacity(0.35)
                     ProviderBlock(name: "Ollama", plan: s.ollamaPlan ?? "cloud", cost: nil,
-                                  rows: ollamaRows, snap: s)
+                                  rows: ollamaRows(s), snap: s)
                 }
-                Spacer(minLength: 0)
+                Spacer(minLength: 2)
                 TokenShareBar(snap: s)
                 footer(s)
             }
         case .systemSmall:
-            // Petit : Claude seul (le plus contraint en pratique) + coût total.
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 5) {
                 ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
-                              rows: claudeRows, snap: s)
+                              rows: claudeRows(s), snap: s)
                 Spacer(minLength: 0)
                 footer(s)
             }
-        default:
-            // Moyen et plus : les deux fournisseurs côte à côte.
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 14) {
-                    ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
-                                  rows: claudeRows, snap: s)
-                    ProviderBlock(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
-                                  rows: codexRows, snap: s)
-                }
+        default:   // systemMedium : les deux gros fournisseurs, empilés.
+            VStack(alignment: .leading, spacing: 7) {
+                ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
+                              rows: claudeRows(s), snap: s)
+                Divider().opacity(0.35)
+                ProviderBlock(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
+                              rows: codexRows(s), snap: s)
                 Spacer(minLength: 0)
                 footer(s)
             }
@@ -301,10 +306,11 @@ struct WidgetBody: View {
         HStack(spacing: 4) {
             Text(t(s, "Today", "Aujourd’hui")).font(.system(size: 10)).foregroundStyle(.secondary)
             Text(humanCost(s.totalCost))
-                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .font(.system(size: 10, weight: .semibold).monospacedDigit())
             if let p = s.projectedCost {
                 Text("· ~\(humanCost(p))").font(.system(size: 10)).foregroundStyle(.tertiary)
             }
+            Spacer(minLength: 0)
         }
     }
 }
