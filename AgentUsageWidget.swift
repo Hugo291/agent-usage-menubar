@@ -47,6 +47,10 @@ struct Snapshot: Codable {
     /// Coût Ollama sur 4 SEMAINES — jamais mêlé aux coûts du jour.
     var ollamaCost4w: Double?
     var ollamaPlan: String?
+    /// Tokens du jour par fournisseur (Ollama absent : son API compte des requêtes,
+    /// pas des tokens).
+    var claudeTokens: Double?
+    var codexTokens: Double?
 
     var isFrench: Bool { lang == "fr" }
 }
@@ -162,6 +166,52 @@ struct ProviderBlock: View {
     }
 }
 
+/// Répartition des tokens du jour entre fournisseurs : une barre empilée + une
+/// légende. Réservée aux tailles où il reste de la place (un widget ne défile pas).
+/// Ollama n'y figure pas — son API ne publie pas de tokens, seulement des requêtes.
+struct TokenShareBar: View {
+    let snap: Snapshot
+
+    private var parts: [(name: String, tokens: Double, color: Color)] {
+        var p: [(String, Double, Color)] = []
+        if let c = snap.claudeTokens, c > 0 { p.append(("Claude", c, .blue)) }
+        if let x = snap.codexTokens, x > 0 { p.append(("Codex", x, .orange)) }
+        return p
+    }
+
+    var body: some View {
+        let total = parts.reduce(0.0) { $0 + $1.tokens }
+        if total > 0 {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(t(snap, "Tokens today", "Tokens du jour"))
+                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                GeometryReader { geo in
+                    HStack(spacing: 1) {
+                        ForEach(parts.indices, id: \.self) { i in
+                            Capsule().fill(parts[i].color)
+                                .frame(width: max(2, (geo.size.width - 1) * CGFloat(parts[i].tokens / total)))
+                        }
+                    }
+                }
+                .frame(height: 7)
+                HStack(spacing: 8) {
+                    ForEach(parts.indices, id: \.self) { i in
+                        HStack(spacing: 3) {
+                            Circle().fill(parts[i].color).frame(width: 5, height: 5)
+                            Text("\(parts[i].name) \(Int((parts[i].tokens / total * 100).rounded()))%")
+                                .font(.system(size: 9).monospacedDigit())
+                                .foregroundStyle(.secondary).lineLimit(1)
+                            Text(humanTokens(parts[i].tokens))
+                                .font(.system(size: 8)).foregroundStyle(.tertiary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+}
+
 struct WidgetBody: View {
     @Environment(\.widgetFamily) var family
     let snap: Snapshot?
@@ -221,6 +271,7 @@ struct WidgetBody: View {
                                   rows: ollamaRows, snap: s)
                 }
                 Spacer(minLength: 0)
+                TokenShareBar(snap: s)
                 footer(s)
             }
         case .systemSmall:
@@ -410,6 +461,7 @@ struct CostDetailBody: View {
                     SplitBlock(name: "Codex", cost: s.codexCost, rows: codex, compact: false)
                 }
                 Spacer(minLength: 0)
+                TokenShareBar(snap: s)
                 footer(s)
             }
         default:   // systemMedium : deux colonnes, sinon ça déborde en hauteur.

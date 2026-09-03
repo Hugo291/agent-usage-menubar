@@ -187,6 +187,11 @@ enum WidgetFeed {
         limit("ollamaWeek", u.ollamaWeekly)
         put("ollamaCost4w", u.ollamaCost4w)
         put("ollamaPlan", u.ollamaPlan)
+        // Tokens du jour par fournisseur, pour le graphe de répartition du widget.
+        // Ollama en est ABSENT à dessein : son API ne publie que des `request_count`,
+        // pas des tokens — les mêler fausserait les pourcentages.
+        put("claudeTokens", u.todayTokens)
+        put("codexTokens", u.codexTodayTokens)
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
         // Ventilation par type de token, déjà calculée et localisée ici : l'extension

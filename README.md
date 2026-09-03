@@ -40,6 +40,11 @@ right-click the desktop → **Edit Widgets**, or click the clock → scroll down
 | **Agent Usage** | Claude + Codex quotas, today's cost, projection | small, medium |
 | **Agent Usage — Cost detail** | today's cost **split by token type** (cache read / cache write / output / input), with a proportion bar per row | small, medium, large |
 
+Both **large** sizes also carry a **token-share bar**: today's tokens split by provider, as a
+stacked bar with a legend (`Claude 97% · Codex 3%`). It is on the large sizes only — a widget
+does not scroll, and the smaller ones are already full. **Ollama is deliberately absent from it**:
+its API reports `request_count`, not tokens, so folding it in would make the percentages wrong.
+
 The split is the same one the menu-bar app computes — no prices are hardcoded, a known total is
 divided by price *ratios*, so the rows always add up to the cost shown.
 
