@@ -1,4 +1,16 @@
-<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <rect x="80" y="80" width="864" height="864" rx="193" ry="193" fill="#F4EFE7"/>
-  <rect x="251" y="283" width="522" height="368" fill="#C2674A"/><rect x="152" y="493" width="720" height="90" fill="#C2674A"/><rect x="287" y="651" width="45" height="90" fill="#C2674A"/><rect x="366" y="651" width="45" height="90" fill="#C2674A"/><rect x="613" y="651" width="45" height="90" fill="#C2674A"/><rect x="692" y="651" width="45" height="90" fill="#C2674A"/><rect x="332" y="370" width="45" height="114" fill="#F4EFE7"/><rect x="647" y="370" width="45" height="114" fill="#F4EFE7"/>
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Agent Usage icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1C2230"/><stop offset="1" stop-color="#2C3444"/>
+    </linearGradient>
+  </defs>
+  <rect x="80" y="80" width="864" height="864" rx="193" ry="193" fill="url(#bg)"/>
+  <g stroke-linecap="round" stroke-width="132" fill="none">
+    <line x1="313" y1="324" x2="313" y2="700" stroke="#3A4250"/>
+    <line x1="512" y1="324" x2="512" y2="700" stroke="#3A4250"/>
+    <line x1="711" y1="324" x2="711" y2="700" stroke="#3A4250"/>
+    <line x1="313" y1="373" x2="313" y2="700" stroke="#34D399"/>
+    <line x1="512" y1="479" x2="512" y2="700" stroke="#FBBF24"/>
+    <line x1="711" y1="571" x2="711" y2="700" stroke="#60A5FA"/>
+  </g>
 </svg>

@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
 <title>Agent Usage — Claude, Codex + Ollama in your macOS menu bar</title>
 <meta name="description" content="A tiny native macOS menu-bar widget showing your real Claude, Codex and Ollama Cloud usage: 5h / weekly quotas, daily cost and an end-of-day projection. Plus two Notification Centre widgets. Free, open source.">
 <style>
@@ -64,6 +65,44 @@
     font:13px/1.35 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
     cursor:default;
   }
+
+  /* --- maquettes des widgets WidgetKit (Centre de notifications) --- */
+  .wgrid{display:flex;gap:26px;justify-content:center;flex-wrap:wrap;margin-top:8px}
+  .wg{width:280px}
+  .wg .cap{font-size:12.5px;color:#6b6560;text-align:center;margin-top:10px}
+  .wcard{
+    width:280px;height:280px;box-sizing:border-box;padding:16px;
+    background:rgba(250,250,250,.9);backdrop-filter:blur(30px) saturate(180%);
+    -webkit-backdrop-filter:blur(30px) saturate(180%);
+    border:.5px solid rgba(0,0,0,.10);border-radius:22px;
+    box-shadow:0 12px 34px rgba(0,0,0,.20);
+    color:#0b0b0c;display:flex;flex-direction:column;
+    font:11px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
+  }
+  .wph{display:flex;align-items:baseline;gap:5px;font-size:12px;font-weight:600;margin-bottom:3px}
+  .wph .pl{font-size:10px;color:#9a958e;font-weight:400}
+  .wph .wc{margin-left:auto;font-size:11px;color:#6b6560;font-variant-numeric:tabular-nums;font-weight:400}
+  .wq{display:flex;align-items:center;gap:7px;height:15px}
+  .wq .l{width:46px;color:#6b6560}
+  .wq .t{flex:1;height:4px;border-radius:2px;background:rgba(0,0,0,.13);overflow:hidden}
+  .wq .t i{display:block;height:100%;border-radius:2px}
+  .wq .p{width:36px;text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+  .wq .rt{width:42px;text-align:right;font-size:9px;color:#a5a09a;font-variant-numeric:tabular-nums}
+  .wdiv{height:1px;background:rgba(0,0,0,.09);margin:7px 0}
+  .wchart{margin-top:auto}
+  .wchart .lbl{font-size:9px;font-weight:500;color:#a5a09a;margin-bottom:4px}
+  .wchart .stack{display:flex;gap:1.5px;height:6px}
+  .wchart .stack i{display:block;height:100%;border-radius:3px}
+  .wleg{display:flex;gap:10px;margin-top:4px;font-size:9px;color:#6b6560}
+  .wleg span{display:flex;align-items:center;gap:3px}
+  .wleg em{width:5px;height:5px;border-radius:50%;font-style:normal}
+  .wfoot{margin-top:4px;font-size:10px;color:#6b6560}
+  .wfoot b{font-weight:600}
+  .wsplit{display:flex;align-items:center;gap:5px;font-size:10.5px;margin-bottom:1px}
+  .wsplit .n{color:#6b6560}
+  .wsplit .tk{font-size:9px;color:#a5a09a}
+  .wsplit .d{margin-left:auto;font-weight:600;font-variant-numeric:tabular-nums}
+  .wsplit + .sb{height:2.5px;border-radius:2px;background:#60A5FA;opacity:.65;margin-bottom:5px}
   .macmenu .h{font-weight:700;color:#8a857d;font-size:11.5px;padding:5px 10px 4px}
   .macmenu .s{font-weight:600;padding:8px 10px 2px}
   .macmenu .big{font-weight:600;font-size:14px;padding:5px 10px 0}
@@ -188,6 +227,61 @@
 </div>
 <p class="hint">↑ Switch the preview language — the app has the same toggle built in (English by default).</p>
 
+
+<section class="block">
+  <div class="wrap">
+    <h2 data-en="Also on your desktop" data-fr="Aussi sur votre bureau"></h2>
+    <p class="tagline" style="margin:0 0 18px;font-size:16px" data-en="Two WidgetKit widgets for Notification Centre, installed with the app. Add them from Edit Widgets." data-fr="Deux widgets WidgetKit pour le Centre de notifications, installés avec l’app. Ajoutez-les depuis « Modifier les widgets »."></p>
+    <div class="wgrid">
+
+      <div class="wg">
+        <div class="wcard">
+          <div class="wph">Claude<span class="pl">max</span><span class="wc">$436</span></div>
+          <div class="wq"><span class="l" data-en="5h" data-fr="5h"></span><span class="t"><i style="width:84%;background:#15a049"></i></span><span class="p g">84%</span><span class="rt" data-en="↻ 2 h" data-fr="↻ 2 h"></span></div>
+          <div class="wq"><span class="l" data-en="week" data-fr="hebdo"></span><span class="t"><i style="width:29%;background:#15a049"></i></span><span class="p g">29%</span><span class="rt" data-en="↻ 10 h" data-fr="↻ 10 h"></span></div>
+          <div class="wdiv"></div>
+          <div class="wph">Codex<span class="pl">plus</span><span class="wc">$34</span></div>
+          <div class="wq"><span class="l" data-en="5h" data-fr="5h"></span><span class="t"><i style="width:0%;background:#cf3b30"></i></span><span class="p r">0%</span><span class="rt"></span></div>
+          <div class="wq"><span class="l" data-en="week" data-fr="hebdo"></span><span class="t"><i style="width:53%;background:#15a049"></i></span><span class="p g">53%</span><span class="rt" data-en="↻ 145 h" data-fr="↻ 145 h"></span></div>
+          <div class="wdiv"></div>
+          <div class="wph">Ollama<span class="pl">pro</span></div>
+          <div class="wq"><span class="l" data-en="session" data-fr="session"></span><span class="t"><i style="width:100%;background:#15a049"></i></span><span class="p g">100%</span><span class="rt" data-en="↻ 3 h" data-fr="↻ 3 h"></span></div>
+          <div class="wq"><span class="l" data-en="week" data-fr="hebdo"></span><span class="t"><i style="width:73%;background:#15a049"></i></span><span class="p g">73%</span><span class="rt" data-en="↻ 74 h" data-fr="↻ 74 h"></span></div>
+          <div class="wchart">
+            <div class="lbl" data-en="Tokens today" data-fr="Tokens du jour"></div>
+            <div class="stack"><i style="flex:98;background:#3B82F6"></i><i style="flex:2;background:#F59E0B"></i></div>
+            <div class="wleg"><span><em style="background:#3B82F6"></em>Claude 98% <span class="tk">2.7B</span></span><span><em style="background:#F59E0B"></em>Codex 2% <span class="tk">68M</span></span></div>
+            <div class="wfoot"><span data-en="Today" data-fr="Aujourd’hui"></span> <b>$2166</b> · ~$2258</div>
+          </div>
+        </div>
+        <div class="cap"><b>Agent Usage</b> — <span data-en="quotas at a glance" data-fr="les quotas d’un coup d’œil"></span></div>
+      </div>
+
+      <div class="wg">
+        <div class="wcard">
+          <div class="wph">Claude<span class="wc">$2133</span></div>
+          <div class="wsplit"><span class="n" data-en="cache read" data-fr="cache read"></span><span class="tk">1.4B</span><span class="d">$604</span></div><div class="sb" style="width:77%"></div>
+          <div class="wsplit"><span class="n" data-en="cache write" data-fr="cache write"></span><span class="tk">24M</span><span class="d">$131</span></div><div class="sb" style="width:17%"></div>
+          <div class="wsplit"><span class="n" data-en="output" data-fr="output"></span><span class="tk">2M</span><span class="d">$50</span></div><div class="sb" style="width:6%"></div>
+          <div class="wsplit"><span class="n" data-en="input" data-fr="input"></span><span class="tk">22k</span><span class="d">$0.09</span></div><div class="sb" style="width:2%"></div>
+          <div class="wdiv"></div>
+          <div class="wph">Codex<span class="wc">$34</span></div>
+          <div class="wsplit"><span class="n" data-en="input" data-fr="input"></span><span class="tk">294k</span><span class="d">$1.47</span></div><div class="sb" style="width:86%"></div>
+          <div class="wsplit"><span class="n" data-en="output" data-fr="output"></span><span class="tk">4k</span><span class="d">$0.13</span></div><div class="sb" style="width:8%"></div>
+          <div class="wsplit"><span class="n" data-en="cache read" data-fr="cache read"></span><span class="tk">217k</span><span class="d">$0.11</span></div><div class="sb" style="width:6%"></div>
+          <div class="wchart">
+            <div class="lbl" data-en="Tokens today" data-fr="Tokens du jour"></div>
+            <div class="stack"><i style="flex:98;background:#3B82F6"></i><i style="flex:2;background:#F59E0B"></i></div>
+            <div class="wfoot"><span data-en="Today" data-fr="Aujourd’hui"></span> <b>$2166</b></div>
+          </div>
+        </div>
+        <div class="cap"><b>Agent Usage — Cost detail</b> — <span data-en="where the money goes" data-fr="où part l’argent"></span></div>
+      </div>
+
+    </div>
+    <p class="hint" style="margin-top:18px" data-en="Ollama has no bar in the token chart on purpose: its API reports request counts, not tokens." data-fr="Ollama n’a pas de barre dans le graphe de tokens, volontairement : son API compte des requêtes, pas des tokens."></p>
+  </div>
+</section>
 <section class="block">
   <div class="wrap">
     <h2>What it does</h2>
