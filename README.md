@@ -1,9 +1,10 @@
-# Agent Usage — Claude + Codex in your menu bar (macOS)
+# Agent Usage — Claude, Codex + Ollama in your menu bar (macOS)
 
-A tiny native macOS menu-bar widget that shows **what you have left** for both
-**Claude** and **Codex**, at a glance:
+A tiny native macOS menu-bar widget that shows **what you have left** across
+**Claude**, **Codex** and **Ollama Cloud**, at a glance:
 
-- ⌛ your **5-hour** rolling window and 🗓 your **weekly** quota — for each;
+- ⌛ your **5-hour** rolling window and 🗓 your **weekly** quota — for each
+  (Ollama reports a **session** window instead of a 5-hour one);
 - 💲 today's **combined cost** (via [`ccusage`](https://github.com/ryoppippi/ccusage)) with an **end-of-day projection**;
 - 🔔 an optional **notification** the moment a quota window resets.
 
@@ -15,9 +16,9 @@ Click them for the full breakdown.
 ```
   ⌛70%  🗓20%  $436            ← menu bar (here: Claude — see "Menu bar" below)
 ┌────────────────────────────────────┐
-│ Usage — Claude + Codex             │
+│ Usage — Claude · Codex · Ollama    │
 │ Claude · max                 $436  │
-│  ⌛ 5h    ▬▬▬▬▬▬▭▭▭▭   70%          │
+│  ⌛ 5h    ▬▬▬▬▬▬▭▭▭▭   70%         │
 │    resets today at 05:37 · in 2 h  │
 │  🗓 week  ▬▬▭▭▭▭▭▭▭▭   20%          │
 │    resets tomorrow at 15:37        │
@@ -25,6 +26,9 @@ Click them for the full breakdown.
 │  🗓 week  ▬▬▬▬▬▬▬▭▭▭   78%          │
 │    resets Mon 21 Jul · in 74 h     │
 │  last reading 2 min ago            │
+│ Ollama · pro                       │
+│  ⚡ session ▬▬▬▬▬▬▬▬▬▬  100%       │
+│  🗓 week   ▬▬▬▬▬▬▬▭▭▭   73%         │
 │ Today $437 · ~$768 projected       │
 │ Menu bar ▸ · Language ▸ · Refresh  │
 └────────────────────────────────────┘
@@ -37,7 +41,7 @@ right-click the desktop → **Edit Widgets**, or click the clock → scroll down
 
 | Widget | Shows | Sizes |
 |---|---|---|
-| **Agent Usage** | Claude + Codex quotas, today's cost, projection | small, medium |
+| **Agent Usage** | Claude + Codex quotas, today's cost, projection — **plus Ollama Cloud on the large size** | small, medium, large |
 | **Agent Usage — Cost detail** | today's cost **split by token type** (cache read / cache write / output / input), with a proportion bar per row | small, medium, large |
 
 Both **large** sizes also carry a **token-share bar**: today's tokens split by provider, as a
@@ -65,14 +69,15 @@ Two consequences worth knowing:
 
 ## What the menu bar shows
 
-The dropdown always lists **both** providers. The bar itself is yours to choose, from the
-**Menu bar** submenu — handy when one provider runs dry and you want the other under your eyes
-without clicking:
+The dropdown always lists **every** provider it has data for. The bar itself is yours to choose,
+from the **Menu bar** submenu — handy when one provider runs dry and you want another under your
+eyes without clicking:
 
 | Choice | Bar shows |
 |---|---|
 | **Claude** (default) | `⌛70% 🗓20% $436` — Claude's 5h + weekly, and Claude's cost |
 | **Codex** | `🗓78% $0.75` — Codex's weekly, and Codex's cost |
+| **Ollama** | `⚡100% 🗓73%` — Ollama's session + weekly, and **no cost**: its API only reports a 4-week figure, which would clash with the daily numbers everywhere else |
 | **Total cost** | `$437` — the combined spend, nothing else |
 
 The cost always follows the same choice, so the whole bar talks about one thing.
@@ -150,7 +155,10 @@ printf '%s' 'YOUR_KEY' > ~/.ollama/widget-key && chmod 600 ~/.ollama/widget-key
 ```
 
 The widget reads that file at each refresh and never writes the key anywhere. With no file, the
-Ollama section simply does not appear.
+Ollama section simply does not appear — the menu, the widgets and the **Menu bar ▸ Ollama** choice
+all skip it, and nothing else changes.
+
+The account **plan** shown next to the name (`Ollama · pro`) comes from `POST /api/me`.
 
 Two windows are shown, **session** and **weekly** — the API reports each as a consumed fraction
 (`usage: 1` means the quota is spent, which is what a `429 … reached your session usage limit`
@@ -228,5 +236,5 @@ A single Swift file compiled with `swiftc` into a self-contained, ad-hoc-signed 
 
 ---
 
-*Not affiliated with Anthropic or OpenAI. "Claude" and "Codex" are trademarks of their
-respective owners. This tool only reads your own local usage data.*
+*Not affiliated with Anthropic, OpenAI or Ollama. "Claude", "Codex" and "Ollama" are trademarks
+of their respective owners. This tool only reads your own local usage data.*
