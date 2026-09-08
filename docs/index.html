@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Usage — Claude + Codex in your macOS menu bar</title>
-<meta name="description" content="A tiny native macOS menu-bar widget showing your real Claude and Codex usage: 5h / weekly quotas, daily cost and an end-of-day projection. Free, open source.">
+<title>Agent Usage — Claude, Codex + Ollama in your macOS menu bar</title>
+<meta name="description" content="A tiny native macOS menu-bar widget showing your real Claude, Codex and Ollama Cloud usage: 5h / weekly quotas, daily cost and an end-of-day projection. Plus two Notification Centre widgets. Free, open source.">
 <style>
   :root{
     --accent:#C2674A; --accent-2:#d8825f;
@@ -41,7 +41,7 @@
   .stage{display:flex;justify-content:center;padding:34px 0 0}
   .macframe{
     width:600px;max-width:100%;border-radius:16px;overflow:hidden;position:relative;
-    min-height:510px;padding-bottom:24px;
+    min-height:640px;padding-bottom:24px;
     background:radial-gradient(135% 130% at 78% -18%, #8f82ff 0%, #b06ab3 42%, #3c2a68 100%);
     box-shadow:0 26px 70px rgba(0,0,0,.34);
   }
@@ -123,8 +123,8 @@
 <header>
   <div class="wrap">
     <img class="logo" src="./icon.svg" alt="App icon" width="92" height="92">
-    <h1>Claude&nbsp;+&nbsp;Codex usage, in your menu bar</h1>
-    <p class="tagline">A tiny native macOS widget that shows what you have left — 5-hour &amp; weekly quotas for both Claude and Codex, plus today's cost and an end-of-day projection.</p>
+    <h1>Claude, Codex&nbsp;+&nbsp;Ollama usage, in your menu bar</h1>
+    <p class="tagline">A tiny native macOS widget that shows what you have left — 5-hour &amp; weekly quotas for Claude, Codex and Ollama Cloud, plus today's cost, an end-of-day projection, and two Notification Centre widgets.</p>
     <div class="cta">
       <a class="btn btn-primary" href="https://github.com/Hugo291/agent-usage-menubar">View on GitHub ↗</a>
       <a class="btn btn-ghost" href="#install">Install</a>
@@ -144,7 +144,7 @@
       <span class="clock">Fri 14 Jun&nbsp;&nbsp;9:41 AM</span>
       <span class="item">⌛&nbsp;70%&nbsp;&nbsp;🗓&nbsp;20%&nbsp;&nbsp;$437
         <div class="macmenu">
-          <div class="h" data-en="Usage — Claude + Codex" data-fr="Usage — Claude + Codex"></div>
+          <div class="h" data-en="Usage — Claude · Codex · Ollama" data-fr="Usage — Claude · Codex · Ollama"></div>
           <div class="div"></div>
 
           <div class="ph"><span>Claude · max</span><span class="cost">$436</span></div>
@@ -160,9 +160,19 @@
           <div class="foot" data-en="last reading 2 min ago" data-fr="dernier relevé il y a 2 min"></div>
           <div class="div"></div>
 
+          <!-- Ollama Cloud : pas de colonne coût — son API ne publie qu'un chiffre
+               sur 4 semaines, qui jurerait avec les montants du JOUR ci-dessus. -->
+          <div class="ph"><span>Ollama · pro</span></div>
+          <div class="qr">⚡<span class="ql" data-en="session" data-fr="session"></span><span class="track"><span style="width:100%;background:#15a049"></span></span><span class="pct g">100%</span></div>
+          <div class="rst" data-en="resets in 3 h" data-fr="reset dans 3 h"></div>
+          <div class="qr">🗓<span class="ql" data-en="week" data-fr="hebdo"></span><span class="track"><span style="width:73%;background:#15a049"></span></span><span class="pct g">73%</span></div>
+          <div class="rst" data-en="resets Mon 17 Jun · in 74 h" data-fr="reset lun. 17 juin · dans 74 h"></div>
+          <div class="div"></div>
+
           <div class="foot" data-en="Today $437 · ~$768 projected" data-fr="Aujourd’hui $437 · ~$768 projeté"></div>
           <div class="div"></div>
           <div class="foot" data-en="Updated just now" data-fr="Mis à jour à l’instant"></div>
+          <div class="act"><span data-en="Menu bar" data-fr="Barre de menus"></span><span class="chev">›</span></div>
           <div class="act"><span data-en="Language" data-fr="Langue"></span><span class="chev">›</span></div>
           <div class="act sel"><span data-en="Refresh" data-fr="Rafraîchir"></span></div>
           <div class="act"><span data-en="Quit" data-fr="Quitter"></span></div>
@@ -184,6 +194,8 @@
     <div class="grid">
       <div class="feat"><div class="ic">⌛</div><h3>Real quotas, live</h3><p>Your Claude 5-hour and weekly limits straight from Anthropic's server — account-wide, so it already counts Desktop, Code and web.</p></div>
       <div class="feat"><div class="ic">🤖</div><h3>Codex too</h3><p>Your Codex weekly quota (OpenAI moved Codex to a single weekly window in 2026), read from your local Codex session logs.</p></div>
+      <div class="feat"><div class="ic">🦙</div><h3>Ollama Cloud</h3><p>Session &amp; weekly quotas from <code>ollama.com/api/usage</code>. Opt-in: drop an API key in <code>~/.ollama/widget-key</code> and the section appears — no key, no section.</p></div>
+      <div class="feat"><div class="ic">🧩</div><h3>Desktop widgets</h3><p>Two real WidgetKit widgets for Notification Centre: quotas at a glance, and today's cost split by token type — cache read, cache write, output, input.</p></div>
       <div class="feat"><div class="ic">💲</div><h3>Cost &amp; projection</h3><p>Today's combined cost (via ccusage) with an end-of-day projection at your current rate.</p></div>
       <div class="feat"><div class="ic">🔄</div><h3>Self-refreshing token</h3><p>Renews its own OAuth token from the keychain — no need to keep a terminal open. Read-only, never touches your prompts.</p></div>
       <div class="feat"><div class="ic">🔔</div><h3>Reset alerts</h3><p>An optional system notification the moment any quota window resets and your allowance is full again.</p></div>
@@ -213,7 +225,7 @@ curl -fsSL https://raw.githubusercontent.com/Hugo291/agent-usage-menubar/main/in
   <div class="wrap">
     <p>Free &amp; open source under the MIT license · Built with native Swift · macOS only.<br>
     <a href="https://github.com/Hugo291/agent-usage-menubar">github.com/Hugo291/agent-usage-menubar</a></p>
-    <p class="note">Not affiliated with Anthropic or OpenAI. “Claude” and “Codex” are trademarks of their respective owners.</p>
+    <p class="note">Not affiliated with Anthropic, OpenAI or Ollama. “Claude”, “Codex” and “Ollama” are trademarks of their respective owners.</p>
   </div>
 </footer>
 
