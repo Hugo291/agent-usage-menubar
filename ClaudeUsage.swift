@@ -1,4 +1,5 @@
 import Cocoa
+import Network
 import UserNotifications
 import WidgetKit
 
@@ -38,6 +39,9 @@ enum I18n {
 /// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
 enum BarProvider: String, CaseIterable {
     case claude, codex, ollama
+    /// Modèles locaux (Ollama local + LM Studio) : ni quota ni facture, donc la barre
+    /// montre ce qui existe vraiment — les tokens du jour et le nombre de requêtes.
+    case local
     /// Cumul : la barre ne montre que le coût TOTAL du jour (Claude + Codex). Les
     /// pourcentages, eux, ne se cumulent pas (deux ressources distinctes : 70 % de
     /// Claude + 78 % de Codex ne veut rien dire) → ils restent dans le menu déroulant.
@@ -49,6 +53,7 @@ enum BarProvider: String, CaseIterable {
         case .claude: return "Claude"
         case .codex:  return "Codex"
         case .ollama: return "Ollama"
+        case .local:  return I18n.t("Local models", "Modèles locaux")
         case .total:  return I18n.t("Total cost", "Coût cumulé")
         }
     }
@@ -192,6 +197,15 @@ enum WidgetFeed {
         // pas des tokens — les mêler fausserait les pourcentages.
         put("claudeTokens", u.todayTokens)
         put("codexTokens", u.codexTodayTokens)
+        // Modèles locaux : tokens et requêtes du jour. Ils ne rejoignent NI le coût
+        // total NI la barre de répartition — celle-ci compare des tokens facturés,
+        // et y mêler des tokens gratuits en fausserait la lecture.
+        put("localTokens", u.localTokens)
+        if let r = u.localRequests { d["localRequests"] = r }
+        if let by = u.localByRuntime {
+            let names = by.keys.compactMap { LocalRuntime(rawValue: $0)?.displayName }.sorted()
+            if !names.isEmpty { d["localNames"] = names }
+        }
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
         // Ventilation par type de token, déjà calculée et localisée ici : l'extension
@@ -262,7 +276,34 @@ struct Usage: Codable {
     /// pas la journée) → à afficher tel quel, JAMAIS à additionner au total du jour.
     var ollamaCost4w: Double?
 
-    /// Coût total du jour, toutes sources confondues (Claude + Codex).
+    /// Modèles LOCAUX (Ollama local, LM Studio) : consommation du JOUR, comptée par
+    /// le compteur intégré (cf. `LocalCounter`). Détail par runtime puis par modèle.
+    /// Aucun coût ici — ces modèles tournent sur ta machine, ils ne facturent rien —
+    /// donc rien de tout ça n'entre dans `totalTodayCost`.
+    var localByRuntime: [String: [String: LocalModelUse]]?
+    /// Runtimes qui répondent à l'instant du relevé (indépendant du comptage).
+    var localDetected: [String]?
+    /// Modèles résidents en mémoire au moment du relevé, par runtime.
+    var localLoaded: [String: [String]]?
+
+    var localTokens: Double? {
+        guard let by = localByRuntime else { return nil }
+        let t = by.values.reduce(0.0) { acc, byModel in
+            acc + byModel.values.reduce(0.0) { $0 + $1.total }
+        }
+        return t > 0 ? t : nil
+    }
+    var localRequests: Int? {
+        guard let by = localByRuntime else { return nil }
+        let n = by.values.reduce(0) { acc, byModel in
+            acc + byModel.values.reduce(0) { $0 + $1.requests }
+        }
+        return n > 0 ? n : nil
+    }
+
+    /// Coût total du jour, toutes sources confondues (Claude + Codex). Les modèles
+    /// locaux en sont ABSENTS : ils ne coûtent rien, les y compter pour 0 $ n'ajoute
+    /// rien, et leur inventer un prix d'API serait une mesure imaginaire.
     var totalTodayCost: Double? {
         let parts = [todayCost, codexTodayCost].compactMap { $0 }
         return parts.isEmpty ? nil : parts.reduce(0, +)
@@ -599,6 +640,24 @@ enum Fetcher {
         return (code, json, errMsg)
     }
 
+    /// Remplit la partie « modèles locaux » d'un `Usage`. Sortie en fonction séparée
+    /// parce qu'elle sert aussi aux modes diagnostic (`--mock`, `--local`), qui ne
+    /// passent pas par `fetch`.
+    static func readLocal(into u: inout Usage) {
+        let probe = LocalRuntimes.probe()
+        if !probe.detected.isEmpty {
+            u.localDetected = probe.detected.map { $0.rawValue }
+            var loaded: [String: [String]] = [:]
+            for (rt, names) in probe.loaded where !names.isEmpty { loaded[rt.rawValue] = names }
+            u.localLoaded = loaded.isEmpty ? nil : loaded
+        }
+        let day = LocalUsage.today()
+        // Un runtime peut avoir servi ce matin puis s'être arrêté : on garde ses
+        // compteurs même s'il ne répond plus à la sonde.
+        if !day.runtimes.isEmpty { u.localByRuntime = day.runtimes }
+        dbg("local détectés=\(probe.detected.map { $0.rawValue }) tokens=\(String(describing: u.localTokens)) requêtes=\(String(describing: u.localRequests))")
+    }
+
     static func fetch(_ completion: @escaping (FetchResult) -> Void) {
         DispatchQueue.global().async {
             func done(_ r: FetchResult) { DispatchQueue.main.async { completion(r) } }
@@ -664,6 +723,9 @@ enum Fetcher {
                 u.ollamaPlan = ol.plan
                 dbg("ollama session=\(String(describing: ol.session?.remaining)) hebdo=\(String(describing: ol.weekly?.remaining))")
             }
+
+            // Modèles locaux : détection (toujours) + compteurs du jour (s'il y en a).
+            readLocal(into: &u)
 
             done(.ok(u))
         }
@@ -828,6 +890,430 @@ enum SessionWatcher {
             out.resetsAt = next
         }
         return out
+    }
+}
+
+// MARK: - Modèles LOCAUX (Ollama local + LM Studio)
+
+/// Les deux runtimes locaux gérés. Ils tournent sur TA machine : ni quota, ni
+/// facture. Ce qu'on compte ici, ce sont donc des **tokens** et des **requêtes**,
+/// jamais des dollars (cf. `LocalCounter` pour le « pourquoi » de la méthode).
+enum LocalRuntime: String, Codable, CaseIterable {
+    case ollama, lmstudio
+
+    var displayName: String { self == .ollama ? "Ollama" : "LM Studio" }
+
+    /// Port d'écoute du runtime lui-même (sa valeur par défaut).
+    var upstreamPort: UInt16 { self == .ollama ? 11434 : 1234 }
+
+    /// Port d'écoute du compteur. Convention : port du runtime **+ 1**, pour que
+    /// l'adresse à mettre côté client reste facile à retenir.
+    var counterPort: UInt16 { upstreamPort + 1 }
+
+    /// Sonde de présence — elle sert AUSSI à lister les modèles chargés, donc un
+    /// seul appel suffit par rafraîchissement.
+    var probePath: String { self == .ollama ? "/api/ps" : "/api/v0/models" }
+
+    var upstreamBase: String { "http://127.0.0.1:\(upstreamPort)" }
+    var counterBase: String { "http://127.0.0.1:\(counterPort)" }
+
+    /// Ce que l'utilisateur doit régler côté client pour passer par le compteur.
+    var clientHint: String {
+        self == .ollama ? "OLLAMA_HOST=127.0.0.1:\(counterPort)"
+                        : "base URL → \(counterBase)/v1"
+    }
+}
+
+/// Consommation d'UN modèle sur la journée.
+struct LocalModelUse: Codable {
+    var requests: Int = 0
+    var input: Double = 0
+    var output: Double = 0
+    var total: Double { input + output }
+}
+
+/// Le compteur du jour, par runtime puis par modèle. `day` est une date LOCALE
+/// (`yyyyMMdd`) : au premier accès d'un jour nouveau, tout repart de zéro.
+struct LocalUsageDay: Codable {
+    var day: String = ""
+    var runtimes: [String: [String: LocalModelUse]] = [:]
+
+    var totalTokens: Double {
+        runtimes.values.reduce(0.0) { acc, byModel in
+            acc + byModel.values.reduce(0.0) { $0 + $1.total }
+        }
+    }
+    var totalRequests: Int {
+        runtimes.values.reduce(0) { acc, byModel in
+            acc + byModel.values.reduce(0) { $0 + $1.requests }
+        }
+    }
+}
+
+/// Persistance des compteurs locaux. Écrit depuis les files du relais (une par
+/// connexion), lu depuis la file de rafraîchissement → tout passe par une file
+/// série dédiée.
+enum LocalUsage {
+    private static let q = DispatchQueue(label: "com.hugo.claudeusagewidget.localusage")
+
+    private static var url: URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.hugo.claudeusagewidget", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("local-usage.json")
+    }
+
+    private static func dayKey(_ date: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd"
+        return f.string(from: date)
+    }
+
+    private static func loadRaw() -> LocalUsageDay {
+        guard let d = try? Data(contentsOf: url) else { return LocalUsageDay() }
+        return (try? JSONDecoder().decode(LocalUsageDay.self, from: d)) ?? LocalUsageDay()
+    }
+
+    /// Enregistre UNE requête terminée. Asynchrone : le relais ne doit jamais
+    /// attendre le disque pendant qu'il recopie des octets.
+    static func record(runtime: LocalRuntime, model: String, input: Double, output: Double) {
+        let name = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        q.async {
+            var st = loadRaw()
+            let key = dayKey()
+            if st.day != key { st = LocalUsageDay(day: key, runtimes: [:]) }  // bascule de jour
+            var byModel = st.runtimes[runtime.rawValue] ?? [:]
+            var use = byModel[name] ?? LocalModelUse()
+            use.requests += 1
+            use.input += max(0, input)
+            use.output += max(0, output)
+            byModel[name] = use
+            st.runtimes[runtime.rawValue] = byModel
+            try? JSONEncoder().encode(st).write(to: url, options: .atomic)
+        }
+    }
+
+    /// Les compteurs du jour. Un fichier daté d'hier renvoie un jour VIDE plutôt
+    /// que des chiffres périmés.
+    static func today() -> LocalUsageDay {
+        q.sync {
+            let st = loadRaw()
+            return st.day == dayKey() ? st : LocalUsageDay(day: dayKey(), runtimes: [:])
+        }
+    }
+}
+
+/// Lit, au fil de l'eau, les compteurs de tokens qui passent dans les RÉPONSES d'un
+/// runtime local. On ne s'appuie sur aucune trace laissée par Ollama ou LM Studio :
+/// vérifié, ni l'un ni l'autre ne conserve de total d'usage (le log d'Ollama est un
+/// journal d'accès Gin — requêtes et latences, pas de tokens ; côté LM Studio les
+/// chiffres n'existent que dans les logs du serveur, quand il tourne). La seule
+/// source exacte et commune aux deux, c'est donc le corps des réponses — que chacun
+/// remplit lui-même.
+///
+/// La recherche est volontairement TEXTUELLE et sans structure : on repère les clés
+/// telles qu'elles défilent, dans l'ordre, ce qui marche aussi bien sur du NDJSON
+/// (Ollama), du SSE (`/v1/chat/completions`) que sur une réponse d'un seul bloc.
+/// Les clés sont ancrées sur leur guillemet ouvrant, ce qui évite de confondre
+/// `"eval_count"` avec `"prompt_eval_count"`, ou `"prompt_tokens"` avec le
+/// `"prompt_tokens_count"` des statistiques LM Studio (sans quoi on compterait
+/// deux fois la même requête).
+final class LocalSniffer {
+    private let runtime: LocalRuntime
+    private var pending = ""          // fenêtre glissante de texte pas encore analysé
+    private var model: String?        // dernier modèle annoncé sur CETTE connexion
+    private var carriedInput: Double? // input vu, en attente de son output
+
+    /// Assez pour contenir une clé coupée en deux par une frontière de paquet
+    /// (`"prompt_eval_count":1234567` ≈ 27 octets, un nom de modèle ≈ 80).
+    private static let window = 256
+
+    /// Le délimiteur final (`,` `}` `]`) n'est PAS décoratif : sans lui, un nombre
+    /// coupé par une frontière de paquet (`…"eval_count":2` | `98,…`) serait lu comme
+    /// « 2 » et le reste jeté. En l'exigeant, un nombre incomplet ne matche pas — il
+    /// reste dans le tampon et sera lu entier au paquet suivant. En JSON, un nombre
+    /// est toujours suivi de l'un des trois.
+    private static let scanner: NSRegularExpression? = try? NSRegularExpression(
+        pattern:
+            #"(?<!\\)"(model)"\s*:\s*"([^"]{1,160})""# + "|" +
+            #"(?<!\\)"(?:prompt_eval_count|prompt_tokens|input_tokens)"\s*:\s*([0-9]{1,12})\s*[,}\]]"# + "|" +
+            #"(?<!\\)"(?:eval_count|completion_tokens|output_tokens)"\s*:\s*([0-9]{1,12})\s*[,}\]]"#)
+
+    init(runtime: LocalRuntime) { self.runtime = runtime }
+
+    /// Octets reçus DU runtime. Ils sont relayés tels quels par ailleurs : ici on ne
+    /// fait que lire, donc un décodage approximatif (un caractère multi-octets coupé
+    /// en bout de paquet) est sans conséquence.
+    func consume(_ data: Data) {
+        guard let rx = LocalSniffer.scanner else { return }
+        pending += String(decoding: data, as: UTF8.self)
+        let ns = pending as NSString
+        var lastEnd = 0
+        for m in rx.matches(in: pending, options: [],
+                            range: NSRange(location: 0, length: ns.length)) {
+            lastEnd = m.range.location + m.range.length
+            if m.range(at: 1).location != NSNotFound {
+                model = ns.substring(with: m.range(at: 2))
+            } else if m.range(at: 3).location != NSNotFound {
+                // Deux entrées d'affilée = la requête précédente n'avait pas de sortie
+                // (un embedding, typiquement) : on la clôt avant d'ouvrir la suivante.
+                if carriedInput != nil { commit(output: 0) }
+                carriedInput = Double(ns.substring(with: m.range(at: 3)))
+            } else if m.range(at: 4).location != NSNotFound {
+                commit(output: Double(ns.substring(with: m.range(at: 4))) ?? 0)
+            }
+        }
+        // On ne garde que la queue : jamais les octets déjà analysés (sinon la même
+        // requête serait comptée deux fois), jamais plus que la fenêtre (sinon le
+        // tampon enfle sans fin sur une réponse longue).
+        let keep = max(lastEnd, ns.length - LocalSniffer.window)
+        if keep >= ns.length {
+            pending = ""
+        } else if keep > 0 {
+            // On recale sur une frontière de caractère : un `keep` calculé en unités
+            // UTF-16 peut tomber au milieu d'une paire de substitution.
+            pending = ns.substring(from: ns.rangeOfComposedCharacterSequence(at: keep).location)
+        }
+    }
+
+    /// Fin de connexion : une requête sans jeton de sortie (embedding) est close ici.
+    func finish() { if carriedInput != nil { commit(output: 0) } }
+
+    /// On clôt une requête sur son compteur de SORTIE, parce que les deux runtimes
+    /// écrivent l'entrée avant la sortie (`prompt_eval_count` puis `eval_count` chez
+    /// Ollama, `prompt_tokens` puis `completion_tokens` dans l'objet `usage`). Si un
+    /// jour l'ordre s'inversait, le pire serait une requête comptée deux fois — les
+    /// totaux de tokens, eux, resteraient justes.
+
+    private func commit(output: Double) {
+        let input = carriedInput ?? 0
+        carriedInput = nil
+        guard output > 0 || input > 0 else { return }
+        LocalUsage.record(runtime: runtime, model: model ?? "—", input: input, output: output)
+    }
+}
+
+/// Relais TCP pour UNE connexion cliente. Les octets sont recopiés **à l'identique**
+/// dans les deux sens ; on se contente de les LIRE au passage côté réponse. Comme
+/// rien n'est réécrit, le cadrage HTTP (chunked, SSE, keep-alive) reste forcément
+/// intact : au pire on compte mal, jamais on ne casse un échange.
+final class LocalRelay {
+    private let client: NWConnection
+    private let server: NWConnection
+    private let sniffer: LocalSniffer
+    private var closed = false
+    /// Prévient le compteur que la connexion est finie, pour qu'il lâche sa
+    /// référence (sans quoi les relais s'empileraient indéfiniment en mémoire).
+    var onClose: (() -> Void)?
+
+    init?(client: NWConnection, runtime: LocalRuntime, queue: DispatchQueue) {
+        guard let port = NWEndpoint.Port(rawValue: runtime.upstreamPort) else { return nil }
+        self.client = client
+        self.server = NWConnection(host: NWEndpoint.Host("127.0.0.1"), port: port, using: .tcp)
+        self.sniffer = LocalSniffer(runtime: runtime)
+
+        server.stateUpdateHandler = { [weak self] st in
+            guard let self = self else { return }
+            switch st {
+            case .ready:
+                self.pumpUp()
+                self.pumpDown()
+            case .failed, .cancelled:
+                self.close()
+            default:
+                break
+            }
+        }
+        server.start(queue: queue)
+        client.start(queue: queue)
+    }
+
+    private func close() {
+        guard !closed else { return }
+        closed = true
+        sniffer.finish()
+        client.cancel()
+        server.cancel()
+        onClose?()
+        onClose = nil
+    }
+
+    /// Le relais n'est retenu que par le compteur : quand celui-ci le lâche (arrêt
+    /// du comptage), il faut couper les deux bouts, pas seulement oublier l'objet.
+    deinit { client.cancel(); server.cancel() }
+
+    /// Client → runtime. On ne lit rien : la requête ne porte aucun compteur.
+    private func pumpUp() {
+        client.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self, !self.closed else { return }
+            if let d = data, !d.isEmpty {
+                self.server.send(content: d, completion: .contentProcessed { if $0 != nil { self.close() } })
+            }
+            if error != nil { self.close(); return }
+            if isComplete {
+                // Demi-fermeture : on propage la fin d'envoi sans couper la réponse,
+                // pour les clients qui ferment leur sens montant avant de lire.
+                self.server.send(content: nil, contentContext: .finalMessage,
+                                 isComplete: true, completion: .contentProcessed { _ in })
+                return
+            }
+            self.pumpUp()
+        }
+    }
+
+    /// Runtime → client : relais **et** comptage au passage.
+    private func pumpDown() {
+        server.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self = self, !self.closed else { return }
+            if let d = data, !d.isEmpty {
+                self.sniffer.consume(d)
+                self.client.send(content: d, completion: .contentProcessed { if $0 != nil { self.close() } })
+            }
+            if isComplete || error != nil { self.close(); return }
+            self.pumpDown()
+        }
+    }
+}
+
+/// Le compteur : un écouteur sur la BOUCLE LOCALE par runtime, qui renvoie tout au
+/// runtime réel. Tant qu'il est désactivé, aucun port n'est ouvert.
+final class LocalCounter {
+    static let shared = LocalCounter()
+
+    private var listeners: [LocalRuntime: NWListener] = [:]
+    private var relays: [ObjectIdentifier: LocalRelay] = [:]
+    private let queue = DispatchQueue(label: "com.hugo.claudeusagewidget.localcounter")
+    /// `listeners` et `relays` sont touchés depuis la file du réseau ET depuis le
+    /// thread principal (menu) → un verrou, court et non contendu.
+    private let lock = NSLock()
+
+    /// Les runtimes dont l'écouteur tourne vraiment (un port déjà pris n'y est pas).
+    var running: [LocalRuntime] {
+        lock.lock(); defer { lock.unlock() }
+        return listeners.keys.sorted { $0.rawValue < $1.rawValue }
+    }
+
+    func apply(enabled: Bool) { enabled ? start() : stop() }
+
+    private func start() {
+        for rt in LocalRuntime.allCases where !running.contains(rt) {
+            guard let port = NWEndpoint.Port(rawValue: rt.counterPort) else { continue }
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            // On se lie explicitement à 127.0.0.1 : le compteur ne doit JAMAIS être
+            // joignable depuis le réseau, il relaie un service local sans auth.
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
+            guard let l = try? NWListener(using: params, on: port) else {
+                Fetcher.dbg("compteur local \(rt.rawValue) : port \(rt.counterPort) indisponible")
+                continue
+            }
+            l.newConnectionHandler = { [weak self] conn in
+                guard let self = self,
+                      let relay = LocalRelay(client: conn, runtime: rt, queue: self.queue)
+                else { conn.cancel(); return }
+                // Retenu le temps de la connexion : sans ça le relais serait libéré
+                // aussitôt créé et la connexion mourrait. Relâché à la fermeture.
+                let id = ObjectIdentifier(relay)
+                relay.onClose = { [weak self] in
+                    guard let self = self else { return }
+                    self.lock.lock(); self.relays[id] = nil; self.lock.unlock()
+                }
+                self.lock.lock(); self.relays[id] = relay; self.lock.unlock()
+            }
+            l.stateUpdateHandler = { [weak self] st in
+                if case .failed(let e) = st {
+                    Fetcher.dbg("compteur local \(rt.rawValue) en échec : \(e)")
+                    guard let self = self else { return }
+                    self.lock.lock()
+                    let dead = self.listeners.removeValue(forKey: rt)
+                    self.lock.unlock()
+                    dead?.cancel()
+                }
+            }
+            l.start(queue: queue)
+            lock.lock(); listeners[rt] = l; lock.unlock()
+        }
+    }
+
+    private func stop() {
+        lock.lock()
+        let ls = listeners
+        listeners.removeAll()
+        relays.removeAll()
+        lock.unlock()
+        ls.values.forEach { $0.cancel() }
+    }
+}
+
+/// Activation du compteur local. Désactivé par défaut : ouvrir des ports, même sur
+/// la boucle locale, ne se fait pas dans le dos de l'utilisateur.
+enum LocalCounterPref {
+    private static let key = "widgetLocalCounter"
+    private(set) static var enabled: Bool = UserDefaults.standard.bool(forKey: key)
+
+    static func set(_ on: Bool) {
+        enabled = on
+        UserDefaults.standard.set(on, forKey: key)
+        LocalCounter.shared.apply(enabled: on)
+    }
+    static func toggle() { set(!enabled) }
+}
+
+/// Détection des runtimes locaux et de leurs modèles chargés. Indépendant du
+/// comptage : la section s'affiche dès qu'un runtime répond, même sans compteur.
+enum LocalRuntimes {
+    struct Reading {
+        var detected: [LocalRuntime] = []
+        var loaded: [LocalRuntime: [String]] = [:]
+    }
+
+    /// Appel synchrone et bref — on tourne déjà sur une file de fond, et un runtime
+    /// absent doit coûter le délai le plus court possible (port fermé = refus
+    /// immédiat, pas d'attente du délai de garde).
+    private static func get(_ rt: LocalRuntime, path: String? = nil) -> [String: Any]? {
+        guard let url = URL(string: rt.upstreamBase + (path ?? rt.probePath)) else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        var out: [String: Any]?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let data = data else { return }
+            out = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }.resume()
+        _ = sem.wait(timeout: .now() + 3)
+        return out
+    }
+
+    static func probe() -> Reading {
+        var r = Reading()
+        for rt in LocalRuntime.allCases {
+            switch rt {
+            case .ollama:
+                guard let obj = get(rt) else { continue }
+                r.detected.append(rt)
+                // `/api/ps` ne liste QUE les modèles résidents en mémoire.
+                let models = (obj["models"] as? [[String: Any]]) ?? []
+                r.loaded[rt] = models.compactMap { $0["name"] as? String }
+            case .lmstudio:
+                if let obj = get(rt) {
+                    r.detected.append(rt)
+                    // `/api/v0/models` liste tout le catalogue : on filtre sur l'état.
+                    let models = (obj["data"] as? [[String: Any]]) ?? []
+                    r.loaded[rt] = models
+                        .filter { ($0["state"] as? String) == "loaded" }
+                        .compactMap { $0["id"] as? String }
+                } else if get(rt, path: "/v1/models") != nil {
+                    // LM Studio trop ancien pour `/api/v0` : le serveur est bien là, on
+                    // le signale. Pas de liste de modèles chargés pour autant — `/v1`
+                    // ne publie pas d'état, et deviner vaut moins que ne rien dire.
+                    r.detected.append(rt)
+                }
+            }
+        }
+        return r
     }
 }
 
@@ -1245,6 +1731,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             WidgetFeed.publish(cached.usage, updated: cached.savedAt)
         }
         Notifier.shared.configure()   // délégué + demande d'autorisation des notifs
+        // Compteur des modèles locaux : rouvre les ports si l'option était active.
+        LocalCounter.shared.apply(enabled: LocalCounterPref.enabled)
         // Re-teinte les icônes quand la barre bascule clair ↔ sombre.
         appearanceObs = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
             if let u = self?.lastUsage { self?.updateTitle(u) }
@@ -1419,6 +1907,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 gap()
             }
             segment(symbol: "calendar", fallback: "7j", limit: usage.ollamaWeekly)
+            cost = nil
+        case .local:
+            // Ni quota ni facture côté local : la barre montre ce qui existe
+            // réellement — les tokens du jour, et le nombre de requêtes.
+            if let img = iconImage("cpu", color: .labelColor, appearance: appearance) {
+                let att = NSTextAttachment()
+                att.image = img
+                let h = img.size.height
+                att.bounds = CGRect(x: 0, y: (mono.capHeight - h) / 2,
+                                    width: img.size.width, height: h)
+                s.append(NSAttributedString(attachment: att))
+                s.append(NSAttributedString(string: " ", attributes: [.font: mono]))
+            } else {
+                s.append(NSAttributedString(string: "loc ", attributes: [
+                    .font: mono, .foregroundColor: NSColor.labelColor]))
+            }
+            s.append(NSAttributedString(string: usage.localTokens.map { UI.humanTokens($0) } ?? "—",
+                attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
+            if let r = usage.localRequests {
+                s.append(NSAttributedString(string: "   \(r) req", attributes: [
+                    .font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
+            }
             cost = nil
         case .total:
             cost = usage.totalTodayCost   // pas de quotas : seul l'argent s'additionne
@@ -1625,6 +2135,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         breakdownItem.state = TokenBreakdownPref.enabled ? .on : .off
         items.append(breakdownItem)
 
+        // Bascule : compteur des modèles locaux (ouvre/ferme les ports d'écoute).
+        let localItem = NSMenuItem(
+            title: I18n.t("Count local models", "Compter les modèles locaux"),
+            action: #selector(toggleLocalCounter), keyEquivalent: "")
+        localItem.target = self
+        localItem.state = LocalCounterPref.enabled ? .on : .off
+        localItem.toolTip = I18n.t(
+            "Listens on 127.0.0.1:\(LocalRuntime.ollama.counterPort) (Ollama) and "
+            + "127.0.0.1:\(LocalRuntime.lmstudio.counterPort) (LM Studio) and forwards to the real "
+            + "runtime, counting tokens as they go by. Point your client at that address to be counted.",
+            "Écoute sur 127.0.0.1:\(LocalRuntime.ollama.counterPort) (Ollama) et "
+            + "127.0.0.1:\(LocalRuntime.lmstudio.counterPort) (LM Studio), renvoie au vrai runtime et "
+            + "compte les tokens au passage. Pointe ton client sur cette adresse pour être compté.")
+        items.append(localItem)
+
         // Sous-menu de langue.
         let langItem = NSMenuItem(title: I18n.t("Language", "Langue"), action: nil, keyEquivalent: "")
         let langMenu = NSMenu()
@@ -1658,6 +2183,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Active/désactive l'affichage permanent de la ventilation du coût par type de token.
     @objc func toggleTokenBreakdown() {
         TokenBreakdownPref.toggle()
+        if let u = lastUsage { rebuildMenu(usage: u) }
+    }
+
+    /// Active/désactive le compteur des modèles locaux. Les ports sont ouverts ou
+    /// refermés immédiatement, sans redémarrage.
+    @objc func toggleLocalCounter() {
+        LocalCounterPref.toggle()
         if let u = lastUsage { rebuildMenu(usage: u) }
     }
 
@@ -1749,6 +2281,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
+    /// Section « Modèles locaux » (Ollama local + LM Studio). Elle apparaît dès qu'un
+    /// runtime répond OU qu'on a compté quelque chose aujourd'hui, et reste absente
+    /// sinon — comme Ollama Cloud sans clé. Aucune colonne de dollars : ces modèles
+    /// tournent sur la machine, leur consommation se mesure en tokens.
+    private func localItems(_ u: Usage) -> [NSMenuItem] {
+        let detected = (u.localDetected ?? []).compactMap { LocalRuntime(rawValue: $0) }
+        let counted = u.localByRuntime ?? [:]
+        guard !detected.isEmpty || !counted.isEmpty else { return [] }
+
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
+
+        /// Ligne « libellé … valeur », valeur alignée à droite.
+        func row(_ label: String, _ value: String, indent: CGFloat,
+                 size: CGFloat, color: NSColor) -> NSMenuItem {
+            let s = NSMutableAttributedString(string: label, attributes: [
+                .font: NSFont.systemFont(ofSize: size), .foregroundColor: color,
+                .paragraphStyle: para])
+            s.append(NSAttributedString(string: "\t" + value, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular),
+                .foregroundColor: color, .paragraphStyle: para]))
+            return self.displayItem(s, indent: indent)
+        }
+
+        func note(_ text: String, indent: CGFloat = 16) -> NSMenuItem {
+            self.displayItem(NSAttributedString(string: text, attributes: [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.tertiaryLabelColor]), indent: indent)
+        }
+
+        // En-tête : total de tokens du jour à droite — là où les autres sections
+        // affichent des dollars, pour garder la même colonne de lecture.
+        let head = NSMutableAttributedString(string: I18n.t("Local models", "Modèles locaux"),
+            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                         .foregroundColor: NSColor.labelColor, .paragraphStyle: para])
+        if let t = u.localTokens {
+            head.append(NSAttributedString(string: "\t" + UI.humanTokens(t) + " tok", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+        }
+        var items = [displayItem(head, indent: 16, toolTip: I18n.t(
+            "Runs on your Mac: no quota and no bill — so this counts tokens and requests, not dollars.",
+            "Tourne sur ton Mac : ni quota ni facture — on compte donc des tokens et des requêtes, pas des dollars."))]
+
+        // Un bloc par runtime, puis le détail par modèle (les plus gros d'abord).
+        for rt in LocalRuntime.allCases {
+            let models = counted[rt.rawValue] ?? [:]
+            let isUp = detected.contains(rt)
+            guard isUp || !models.isEmpty else { continue }
+            let name = rt.displayName + (isUp ? "" : I18n.t(" · stopped", " · arrêté"))
+            let value = models.isEmpty
+                ? I18n.t("nothing counted", "rien de compté")
+                : "\(models.values.reduce(0) { $0 + $1.requests }) req  ·  "
+                  + UI.humanTokens(models.values.reduce(0.0) { $0 + $1.total })
+            items.append(row(name, value, indent: 28, size: 11, color: .secondaryLabelColor))
+
+            for (model, use) in models.sorted(by: { $0.value.total > $1.value.total }).prefix(4) {
+                items.append(row(model, "\(use.requests) req  ·  \(UI.humanTokens(use.total))",
+                                 indent: 44, size: 10, color: .tertiaryLabelColor))
+            }
+            // Rien de compté mais un modèle en mémoire : dire ce qui tourne évite de
+            // laisser croire que la détection a échoué.
+            if models.isEmpty, let loaded = u.localLoaded?[rt.rawValue], !loaded.isEmpty {
+                items.append(note(I18n.t("loaded: ", "chargé : ") + loaded.prefix(2).joined(separator: ", "),
+                                  indent: 44))
+            }
+        }
+
+        // Comment obtenir des chiffres : le compteur ne voit que ce qui passe par lui.
+        if !LocalCounterPref.enabled {
+            items.append(note(I18n.t("Counter off — switch on “Count local models” below.",
+                                     "Compteur éteint — active « Compter les modèles locaux » plus bas.")))
+        } else {
+            let listening = LocalCounter.shared.running
+            for rt in (detected.isEmpty ? LocalRuntime.allCases : detected) {
+                if !listening.contains(rt) {
+                    items.append(note(I18n.t("\(rt.displayName): port \(rt.counterPort) taken — not counting",
+                                             "\(rt.displayName) : port \(rt.counterPort) occupé — pas de comptage"),
+                                      indent: 28))
+                } else if (counted[rt.rawValue] ?? [:]).isEmpty {
+                    items.append(note("\(rt.displayName) → \(rt.clientHint)", indent: 28))
+                }
+            }
+        }
+        return items
+    }
+
     func rebuildMenu(usage: Usage? = nil, loadingMessage: String? = nil,
                      errorMessage: String? = nil, noticeMessage: String? = nil,
                      offlineCost: Double? = nil) {
@@ -1784,6 +2403,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !ollama.isEmpty {
                 menu.addItem(.separator())
                 for item in ollama { menu.addItem(item) }
+            }
+            let local = localItems(u)
+            if !local.isEmpty {
+                menu.addItem(.separator())
+                for item in local { menu.addItem(item) }
             }
             // Pied : coût total du jour (Claude + Codex) + projection.
             if let total = u.totalTodayCost {
@@ -1834,16 +2458,22 @@ func printUsage(_ u: Usage) {
     let codexBar = (u.codexFiveHour.map { "5h \(pct($0))  ·  " } ?? "") + "7j \(pct(u.codexSevenDay))"
     let ollamaBar = (u.ollamaSession.map { _ in "ses \(pct(u.ollamaSession))  ·  " } ?? "")
         + "7j \(pct(u.ollamaWeekly))"
+    let localBar = (u.localTokens.map { UI.humanTokens($0) } ?? "—")
+        + (u.localRequests.map { "  ·  \($0) req" } ?? "")
     let (barBody, barCost): (String, Double?) = {
         switch BarPref.current {
         case .claude: return (claudeBar, u.todayCost)
         case .codex:  return (codexBar, u.codexTodayCost)
         case .ollama: return (ollamaBar, nil)
+        case .local:  return (localBar, nil)
         case .total:  return ("", u.totalTodayCost)
         }
     }()
-    print("Titre barre  : [\(BarPref.current.menuTitle)] \(barBody)"
-          + (barCost.map { (barBody.isEmpty ? "" : "  ·  ") + UI.humanCost($0) } ?? "$—"))
+    // Le « $— » n'a de sens que si la barre ne montre RIEN d'autre (mode cumul sans
+    // ccusage) : Ollama et les modèles locaux n'ont pas de coût du jour à afficher.
+    let barTail = barCost.map { (barBody.isEmpty ? "" : "  ·  ") + UI.humanCost($0) }
+        ?? (barBody.isEmpty ? "$—" : "")
+    print("Titre barre  : [\(BarPref.current.menuTitle)] \(barBody)" + barTail)
     print("— Claude" + (u.claudePlan.map { " (plan \($0))" } ?? "") + " —")
     line("Fenêtre 5 h ", u.fiveHour)
     line("Quota hebdo ", u.sevenDay)
@@ -1858,6 +2488,28 @@ func printUsage(_ u: Usage) {
         line("Session     ", u.ollamaSession)
         line("Hebdo       ", u.ollamaWeekly)
         if let c = u.ollamaCost4w { print("Ollama (4 sem.): \(UI.humanCost(c, decimals: 2))") }
+    }
+    if u.localDetected != nil || u.localByRuntime != nil {
+        let up = (u.localDetected ?? []).compactMap { LocalRuntime(rawValue: $0)?.displayName }
+        print("— Modèles locaux —")
+        print("Détectés    : " + (up.isEmpty ? "aucun" : up.joined(separator: ", "))
+              + (LocalCounterPref.enabled ? "  (compteur actif)" : "  (compteur éteint)"))
+        for rt in LocalRuntime.allCases {
+            guard let models = u.localByRuntime?[rt.rawValue], !models.isEmpty else { continue }
+            let reqs = models.values.reduce(0) { $0 + $1.requests }
+            let toks = models.values.reduce(0.0) { $0 + $1.total }
+            print("\(rt.displayName.padding(toLength: 12, withPad: " ", startingAt: 0)): \(reqs) req · \(UI.humanTokens(toks)) tokens")
+            for (model, use) in models.sorted(by: { $0.value.total > $1.value.total }) {
+                print("  \(model.padding(toLength: 26, withPad: " ", startingAt: 0))"
+                      + "\(use.requests) req · in \(UI.humanTokens(use.input)) · out \(UI.humanTokens(use.output))")
+            }
+        }
+        if u.localByRuntime == nil {
+            print("Compté      : rien aujourd'hui"
+                  + (LocalCounterPref.enabled
+                     ? " — pointe le client sur " + LocalRuntime.allCases.map { $0.clientHint }.joined(separator: " / ")
+                     : " — active le compteur dans le menu"))
+        }
     }
     if let cc = u.codexTodayCost, let ct = u.codexTodayTokens {
         print("Codex (jour): \(UI.humanCost(cc, decimals: 2)) · \(UI.humanTokens(ct)) tokens")
@@ -1892,6 +2544,42 @@ if CommandLine.arguments.contains("--notify-test") {
     exit(0)
 }
 
+// `--local` : diagnostic des modèles locaux SEULS (aucun appel réseau sortant, pas
+// de trousseau). Sonde Ollama et LM Studio, imprime les compteurs du jour et, avec
+// `--serve`, tient le compteur ouvert pour qu'on puisse lui envoyer du trafic.
+if CommandLine.arguments.contains("--local") {
+    var u = Usage()
+    Fetcher.readLocal(into: &u)
+    for rt in LocalRuntime.allCases {
+        let up = (u.localDetected ?? []).contains(rt.rawValue)
+        print("\(rt.displayName.padding(toLength: 12, withPad: " ", startingAt: 0)): "
+              + (up ? "en ligne sur \(rt.upstreamBase)" : "absent (\(rt.upstreamBase))")
+              + "   compteur → \(rt.counterBase)  [\(rt.clientHint)]")
+        if let loaded = u.localLoaded?[rt.rawValue], !loaded.isEmpty {
+            print("              chargé : " + loaded.joined(separator: ", "))
+        }
+    }
+    let day = LocalUsage.today()
+    if day.runtimes.isEmpty {
+        print("Compteurs du jour : vides.")
+    } else {
+        print("Compteurs du jour : \(day.totalRequests) req · \(UI.humanTokens(day.totalTokens)) tokens")
+        for (rt, models) in day.runtimes.sorted(by: { $0.key < $1.key }) {
+            for (model, use) in models.sorted(by: { $0.value.total > $1.value.total }) {
+                print("  \(rt)/\(model) : \(use.requests) req · in \(UI.humanTokens(use.input)) · out \(UI.humanTokens(use.output))")
+            }
+        }
+    }
+    if CommandLine.arguments.contains("--serve") {
+        LocalCounter.shared.apply(enabled: true)
+        let ports = LocalCounter.shared.running.map { "\($0.displayName) \($0.counterBase)" }
+        print("Compteur ouvert : " + (ports.isEmpty ? "AUCUN port (déjà pris ?)" : ports.joined(separator: "  ·  ")))
+        print("Ctrl-C pour arrêter. Envoie une requête, puis relance `--local` pour voir le total.")
+        RunLoop.main.run()
+    }
+    exit(0)
+}
+
 // `--mock` : utilisation factice (pas d'appel réseau) + vraies données ccusage.
 // Sert à vérifier le rendu coût/tokens quand l'API est rate-limitée (429).
 if CommandLine.arguments.contains("--mock") {
@@ -1917,6 +2605,7 @@ if CommandLine.arguments.contains("--mock") {
     u.codexSevenDay = cl.sevenDay
     u.codexPlan = cl.plan
     u.codexAsOf = cl.asOf
+    Fetcher.readLocal(into: &u)
     print("[MOCK — utilisation factice 30%/80%, données ccusage + quotas Codex réels]")
     printUsage(u)
     // Vérif du round-trip Codable EN MÉMOIRE (ne pollue pas le vrai cache disque).

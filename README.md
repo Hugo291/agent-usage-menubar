@@ -1,11 +1,14 @@
-# Agent Usage — Claude, Codex + Ollama in your menu bar (macOS)
+# Agent Usage — Claude, Codex, Ollama + local models in your menu bar (macOS)
 
 A tiny native macOS menu-bar widget that shows **what you have left** across
-**Claude**, **Codex** and **Ollama Cloud**, at a glance:
+**Claude**, **Codex** and **Ollama Cloud** — and **what you've used** on the models
+running on your own Mac (**Ollama** and **LM Studio**), at a glance:
 
 - ⌛ your **5-hour** rolling window and 🗓 your **weekly** quota — for each
   (Ollama reports a **session** window instead of a 5-hour one);
 - 💲 today's **combined cost** (via [`ccusage`](https://github.com/ryoppippi/ccusage)) with an **end-of-day projection**;
+- 🖥 today's **tokens and requests per local model** — no quota and no bill there, so
+  that's what there is to count;
 - 🔔 an optional **notification** the moment a quota window resets.
 
 The menu-bar icons stay monochrome and only turn **orange/red** when a quota gets low.
@@ -29,6 +32,11 @@ Click them for the full breakdown.
 │ Ollama · pro                       │
 │  ⚡ session ▬▬▬▬▬▬▬▬▬▬  100%       │
 │  🗓 week   ▬▬▬▬▬▬▬▭▭▭   73%         │
+│ Local models              1,4 M tok│
+│  Ollama            18 req · 920 k  │
+│    llama3.1:8b     12 req · 780 k  │
+│    qwen2.5:7b       6 req · 140 k  │
+│  LM Studio          9 req · 480 k  │
 │ Today $437 · ~$768 projected       │
 │ Menu bar ▸ · Language ▸ · Refresh  │
 └────────────────────────────────────┘
@@ -41,13 +49,16 @@ right-click the desktop → **Edit Widgets**, or click the clock → scroll down
 
 | Widget | Shows | Sizes |
 |---|---|---|
-| **Agent Usage** | Claude + Codex quotas, today's cost, projection — **plus Ollama Cloud on the large size** | small, medium, large |
+| **Agent Usage** | Claude + Codex quotas, today's cost, projection — **plus Ollama Cloud and a local-models line on the large size** | small, medium, large |
 | **Agent Usage — Cost detail** | today's cost **split by token type** (cache read / cache write / output / input), with a proportion bar per row | small, medium, large |
 
 Both **large** sizes also carry a **token-share bar**: today's tokens split by provider, as a
 stacked bar with a legend (`Claude 97% · Codex 3%`). It is on the large sizes only — a widget
-does not scroll, and the smaller ones are already full. **Ollama is deliberately absent from it**:
-its API reports `request_count`, not tokens, so folding it in would make the percentages wrong.
+does not scroll, and the smaller ones are already full. **Ollama Cloud and local models are
+deliberately absent from it**: Ollama's API reports `request_count`, not tokens, and local
+tokens are free — the bar compares *billed* tokens, so folding either in would make the
+percentages wrong. Local usage gets its own line underneath instead, and only once there is
+something to show.
 
 The split is the same one the menu-bar app computes — no prices are hardcoded, a known total is
 divided by price *ratios*, so the rows always add up to the cost shown.
@@ -78,6 +89,7 @@ eyes without clicking:
 | **Claude** (default) | `⌛70% 🗓20% $436` — Claude's 5h + weekly, and Claude's cost |
 | **Codex** | `🗓78% $0.75` — Codex's weekly, and Codex's cost |
 | **Ollama** | `⚡100% 🗓73%` — Ollama's session + weekly, and **no cost**: its API only reports a 4-week figure, which would clash with the daily numbers everywhere else |
+| **Local models** | `🖥 1,4 M  18 req` — today's tokens and requests on your own machine, and **no cost**: they don't bill anything |
 | **Total cost** | `$437` — the combined spend, nothing else |
 
 The cost always follows the same choice, so the whole bar talks about one thing.
@@ -178,6 +190,54 @@ response headers, not even on the `429`:
 Ollama's `activity.cost` covers the **last 4 weeks**, not today, so it is labelled as such and is
 never added to the daily total or the projection.
 
+### Local models (Ollama + LM Studio) — opt-in, counted as they run
+Models running on your own Mac have **no quota and no bill**, so there is no percentage
+and no dollar figure to show. What there *is* to count is **tokens and requests, per
+model** — and that is what this section does.
+
+**The section appears on its own** as soon as either runtime answers on its default port
+(Ollama on `11434`, LM Studio on `1234`), listing what is loaded in memory. Counting
+tokens is a separate, explicit step.
+
+**Why an opt-in counter and not a log file.** Neither runtime keeps a usage total you
+could read after the fact:
+
+- Ollama's `~/.ollama/logs/server.log` is a Gin **access log** — method, path, status,
+  latency, one line per call. No tokens, no model name. Persisting a token total is
+  still an [open feature request](https://github.com/ollama/ollama/issues/11118).
+- LM Studio prints token counts, but only into `~/.lmstudio/server-logs/` while its
+  server is running, in an unversioned text format — and not at all for chats held in
+  its own window.
+
+The exact numbers exist in exactly one place: **the responses themselves**, where both
+runtimes report their own counts (`prompt_eval_count` / `eval_count` for Ollama,
+`usage.prompt_tokens` / `completion_tokens` on the OpenAI-compatible routes both
+expose). So the widget reads them there, as they go past.
+
+**Turn on `Count local models`** in the menu. The app then listens on the loopback
+address only, at **the runtime's port + 1**, and forwards everything to the real
+runtime. Point your client at it and its traffic is counted:
+
+| Runtime | Counter address | What to change client-side |
+|---|---|---|
+| Ollama | `127.0.0.1:11435` | `OLLAMA_HOST=127.0.0.1:11435` |
+| LM Studio | `127.0.0.1:1235` | base URL → `http://127.0.0.1:1235/v1` |
+
+Nothing is rewritten in transit — bytes are relayed **verbatim** in both directions and
+merely read on the way back, so chunked encoding, SSE streaming and keep-alive keep
+working exactly as before. The worst a mistake there can do is miscount; it cannot
+corrupt a request. Switch the option off and both ports close immediately.
+
+Two honest limits: **only traffic that goes through the counter is counted** (anything
+sent straight to `11434` / `1234` stays invisible, by construction), and the counters
+**reset at local midnight** — this is a "today" figure, like the costs above, not an
+archive. If the port is already taken the menu says so rather than counting nothing in
+silence.
+
+Local tokens are deliberately kept **out of** the daily cost, the projection and the
+widget's token-share bar: that bar compares *billed* tokens, and folding in free ones
+would make its percentages mean nothing.
+
 ### Cost & tokens
 `ccusage claude daily` (Claude only — not the agent-wide `ccusage daily`, which would fold in
 Codex and others) and `ccusage codex daily` (Codex) provide today's cost and token counts. Each
@@ -215,7 +275,13 @@ ClaudeUsageWidget --once     # real /usage + ccusage call, print and exit
 ClaudeUsageWidget --mock     # no network: fake quotas + real ccusage / Codex data
 ClaudeUsageWidget --refresh  # force an OAuth token refresh + rewrite the keychain item
 ClaudeUsageWidget --notify-test  # send a sample notification
+ClaudeUsageWidget --local    # local runtimes only: what's up, what's loaded, today's counters
+ClaudeUsageWidget --local --serve  # …and hold the counter open, to send it a test request
 ```
+
+`--local` touches neither the network nor the keychain, which makes it the quick way to
+check the counter end to end: run it with `--serve` in one terminal, send a request
+through `127.0.0.1:11435`, then run plain `--local` in another to see the total move.
 
 ## How it's built
 
@@ -236,5 +302,6 @@ A single Swift file compiled with `swiftc` into a self-contained, ad-hoc-signed 
 
 ---
 
-*Not affiliated with Anthropic, OpenAI or Ollama. "Claude", "Codex" and "Ollama" are trademarks
-of their respective owners. This tool only reads your own local usage data.*
+*Not affiliated with Anthropic, OpenAI, Ollama or LM Studio. "Claude", "Codex", "Ollama" and
+"LM Studio" are trademarks of their respective owners. This tool only reads your own local
+usage data.*

@@ -92,6 +92,7 @@ swiftc -O -swift-version 5 \
     "$SRC_DIR/ClaudeUsage.swift" \
     -o "$STAGE/Contents/MacOS/$APP_NAME" \
     -framework Cocoa \
+    -framework Network \
     -framework UserNotifications \
     -framework WidgetKit
 

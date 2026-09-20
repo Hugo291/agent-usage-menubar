@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="./icon.svg" type="image/svg+xml">
 <title>Agent Usage — Claude, Codex + Ollama in your macOS menu bar</title>
-<meta name="description" content="A tiny native macOS menu-bar widget showing your real Claude, Codex and Ollama Cloud usage: 5h / weekly quotas, daily cost and an end-of-day projection. Plus two Notification Centre widgets. Free, open source.">
+<meta name="description" content="A tiny native macOS menu-bar widget showing your real Claude, Codex and Ollama Cloud usage: 5h / weekly quotas, daily cost and an end-of-day projection — plus tokens and requests for the local models you run with Ollama and LM Studio. Two Notification Centre widgets included. Free, open source.">
 <style>
   :root{
     --accent:#C2674A; --accent-2:#d8825f;
@@ -121,6 +121,9 @@
   .g{color:#15a049} .o{color:#df8409} .r{color:#df2f27}
   .macmenu .ph{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;padding:8px 12px 3px}
   .macmenu .ph .cost{font-weight:400;font-size:11.5px;color:#8c877f}
+  /* Modèles locaux : ni jauge ni dollars — juste « nom … tokens », les modèles en retrait. */
+  .macmenu .lr{display:flex;justify-content:space-between;color:#8c877f;font-size:11px;padding:1.5px 12px}
+  .macmenu .lr.sub{color:#9c978f;font-size:10px;padding-left:26px}
   .macmenu .qr{display:flex;align-items:center;gap:7px;padding:2px 12px;font-size:12.5px}
   .macmenu .qr .ql{color:#8c877f;font-size:11px;width:30px}
   .macmenu .track{margin-left:auto;width:118px;height:6px;border-radius:3px;background:rgba(0,0,0,.13);overflow:hidden;flex:none}
@@ -163,7 +166,7 @@
   <div class="wrap">
     <img class="logo" src="./icon.svg" alt="App icon" width="92" height="92">
     <h1>Claude, Codex&nbsp;+&nbsp;Ollama usage, in your menu bar</h1>
-    <p class="tagline">A tiny native macOS widget that shows what you have left — 5-hour &amp; weekly quotas for Claude, Codex and Ollama Cloud, plus today's cost, an end-of-day projection, and two Notification Centre widgets.</p>
+    <p class="tagline">A tiny native macOS widget that shows what you have left — 5-hour &amp; weekly quotas for Claude, Codex and Ollama Cloud, what you've used on your own local models (Ollama, LM Studio), plus today's cost, an end-of-day projection, and two Notification Centre widgets.</p>
     <div class="cta">
       <a class="btn btn-primary" href="https://github.com/Hugo291/agent-usage-menubar">View on GitHub ↗</a>
       <a class="btn btn-ghost" href="#install">Install</a>
@@ -206,6 +209,15 @@
           <div class="rst" data-en="resets in 3 h" data-fr="reset dans 3 h"></div>
           <div class="qr">🗓<span class="ql" data-en="week" data-fr="hebdo"></span><span class="track"><span style="width:73%;background:#15a049"></span></span><span class="pct g">73%</span></div>
           <div class="rst" data-en="resets Mon 17 Jun · in 74 h" data-fr="reset lun. 17 juin · dans 74 h"></div>
+          <div class="div"></div>
+
+          <!-- Modèles locaux : ils tournent sur la machine — ni quota ni facture,
+               donc on compte ce qui existe : des tokens et des requêtes. -->
+          <div class="ph"><span data-en="Local models" data-fr="Modèles locaux"></span><span class="cost">1.4 M tok</span></div>
+          <div class="lr"><span>Ollama</span><span>18 req · 920 k</span></div>
+          <div class="lr sub"><span>llama3.1:8b</span><span>12 req · 780 k</span></div>
+          <div class="lr sub"><span>qwen2.5:7b</span><span>6 req · 140 k</span></div>
+          <div class="lr"><span>LM Studio</span><span>9 req · 480 k</span></div>
           <div class="div"></div>
 
           <div class="foot" data-en="Today $437 · ~$768 projected" data-fr="Aujourd’hui $437 · ~$768 projeté"></div>
@@ -289,6 +301,7 @@
       <div class="feat"><div class="ic">⌛</div><h3>Real quotas, live</h3><p>Your Claude 5-hour and weekly limits straight from Anthropic's server — account-wide, so it already counts Desktop, Code and web.</p></div>
       <div class="feat"><div class="ic">🤖</div><h3>Codex too</h3><p>Your Codex weekly quota (OpenAI moved Codex to a single weekly window in 2026), read from your local Codex session logs.</p></div>
       <div class="feat"><div class="ic">🦙</div><h3>Ollama Cloud</h3><p>Session &amp; weekly quotas from <code>ollama.com/api/usage</code>. Opt-in: drop an API key in <code>~/.ollama/widget-key</code> and the section appears — no key, no section.</p></div>
+      <div class="feat"><div class="ic">🖥</div><h3>Local models</h3><p>Ollama and LM Studio running on your own Mac: today's tokens and requests, per model. No quota and no bill there, so that's what there is to count — opt in and route your client through the built-in counter.</p></div>
       <div class="feat"><div class="ic">🧩</div><h3>Desktop widgets</h3><p>Two real WidgetKit widgets for Notification Centre: quotas at a glance, and today's cost split by token type — cache read, cache write, output, input.</p></div>
       <div class="feat"><div class="ic">💲</div><h3>Cost &amp; projection</h3><p>Today's combined cost (via ccusage) with an end-of-day projection at your current rate.</p></div>
       <div class="feat"><div class="ic">🔄</div><h3>Self-refreshing token</h3><p>Renews its own OAuth token from the keychain — no need to keep a terminal open. Read-only, never touches your prompts.</p></div>

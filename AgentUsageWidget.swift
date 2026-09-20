@@ -51,6 +51,12 @@ struct Snapshot: Codable {
     /// pas des tokens).
     var claudeTokens: Double?
     var codexTokens: Double?
+    /// Modèles LOCAUX (Ollama local, LM Studio) : tokens et requêtes du jour, et le
+    /// nom des runtimes qui ont servi. Jamais de coût — ils tournent sur la machine —
+    /// et volontairement hors de `TokenShareBar`, qui compare des tokens FACTURÉS.
+    var localTokens: Double?
+    var localRequests: Int?
+    var localNames: [String]?
 
     var isFrench: Bool { lang == "fr" }
 }
@@ -226,6 +232,34 @@ struct TokenShareBar: View {
     }
 }
 
+/// Modèles locaux, sur une ligne discrète. Ni jauge ni dollars : ils n'ont pas de
+/// quota et ne facturent rien — ce qui se mesure, ce sont des tokens et des requêtes.
+/// Absente tant que rien n'a été compté, donc sans effet sur la mise en page.
+struct LocalLine: View {
+    let snap: Snapshot
+
+    var body: some View {
+        if let tokens = snap.localTokens, tokens > 0 {
+            HStack(spacing: 5) {
+                Image(systemName: "cpu")
+                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                Text(snap.localNames?.joined(separator: " · ") ?? t(snap, "Local", "Local"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 2)
+                Text(humanTokens(tokens))
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if let r = snap.localRequests {
+                    Text("· \(r) req")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+}
+
 struct WidgetBody: View {
     @Environment(\.widgetFamily) var family
     let snap: Snapshot?
@@ -282,6 +316,7 @@ struct WidgetBody: View {
                 // et creusait un grand vide sous les quotas. Placé après le pied, le
                 // contenu reste groupé en haut et le surplus retombe en bas.
                 TokenShareBar(snap: s).padding(.top, 2)
+                LocalLine(snap: s)
                 footer(s)
                 Spacer(minLength: 0)
             }
