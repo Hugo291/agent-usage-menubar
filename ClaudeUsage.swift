@@ -285,6 +285,12 @@ struct Usage: Codable {
     var localDetected: [String]?
     /// Modèles résidents en mémoire au moment du relevé, par runtime.
     var localLoaded: [String: [String]]?
+    /// Échéance de déchargement (epoch) des modèles résidents, par runtime puis modèle.
+    var localExpiry: [String: [String: Double]]?
+    /// Occupation GPU globale (%) au relevé.
+    var localGPU: Double?
+    /// Processus hors Ollama / LM Studio qui ont des poids de modèle chargés sur le GPU.
+    var localProcs: [LocalProc]?
 
     var localTokens: Double? {
         guard let by = localByRuntime else { return nil }
@@ -650,7 +656,13 @@ enum Fetcher {
             var loaded: [String: [String]] = [:]
             for (rt, names) in probe.loaded where !names.isEmpty { loaded[rt.rawValue] = names }
             u.localLoaded = loaded.isEmpty ? nil : loaded
+            var exp: [String: [String: Double]] = [:]
+            for (rt, byModel) in probe.expiry where !byModel.isEmpty { exp[rt.rawValue] = byModel }
+            u.localExpiry = exp.isEmpty ? nil : exp
         }
+        u.localGPU = GPUProbe.utilization()
+        let procs = GPUProbe.processes()
+        u.localProcs = procs.isEmpty ? nil : procs
         let day = LocalUsage.today()
         // Un runtime peut avoir servi ce matin puis s'être arrêté : on garde ses
         // compteurs même s'il ne répond plus à la sonde.
@@ -921,6 +933,117 @@ enum LocalRuntime: String, Codable, CaseIterable {
     var clientHint: String {
         self == .ollama ? "OLLAMA_HOST=127.0.0.1:\(counterPort)"
                         : "base URL → \(counterBase)/v1"
+    }
+}
+
+/// Un modèle qui tourne hors Ollama / LM Studio (script MLX, llama.cpp, Draw Things…).
+struct LocalProc: Codable, Equatable {
+    var pid: Int32
+    var model: String
+    var engine: String
+    var program: String
+    var started: Double
+}
+
+/// Qui occupe le GPU. macOS n'attribue pas le temps GPU des calculs MLX au processus
+/// (`AppUsage` reste vide), on part donc de l'autre bout : les processus qui ont
+/// ouvert le GPU (AGXDeviceUserClient) ET gardent des poids de modèle ouverts.
+enum GPUProbe {
+    private static func run(_ path: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func matches(_ pattern: String, _ text: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return re.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            Range($0.range(at: 1), in: text).map { String(text[$0]) }
+        }
+    }
+
+    static func utilization() -> Double? {
+        let out = run("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "IOAccelerator"])
+        return matches(#""Device Utilization %"=(\d+)"#, out).first.flatMap(Double.init)
+    }
+
+    /// `etime` de ps : [[jj-]hh:]mm:ss → secondes.
+    private static func seconds(_ etime: String) -> Double {
+        let dayParts = etime.split(separator: "-")
+        let days = dayParts.count == 2 ? Double(dayParts[0]) ?? 0 : 0
+        let hms = (dayParts.last ?? "").split(separator: ":").compactMap { Double($0) }
+        return days * 86_400 + hms.reduce(0) { $0 * 60 + $1 }
+    }
+
+    static func modelName(_ paths: [String]) -> String {
+        for p in paths {
+            if let hub = matches(#"models--([^/]+)"#, p).first {
+                return hub.replacingOccurrences(of: "--", with: "/")
+            }
+        }
+        let first = paths.sorted()[0]
+        if first.hasSuffix(".gguf") {
+            return URL(fileURLWithPath: first).deletingPathExtension().lastPathComponent
+        }
+        // Dossiers-composants (diffusers, mflux) → on remonte jusqu'au dossier du modèle.
+        let generic: Set<String> = ["transformer", "text_encoder", "text_encoder_2", "vae", "unet",
+                                    "tokenizer", "tokenizer_2", "scheduler", "snapshots", "blobs"]
+        var dir = URL(fileURLWithPath: first).deletingLastPathComponent()
+        while generic.contains(dir.lastPathComponent) || dir.lastPathComponent.count == 40 {
+            dir.deleteLastPathComponent()
+        }
+        return dir.lastPathComponent
+    }
+
+    static func processes() -> [LocalProc] {
+        let io = run("/usr/sbin/ioreg", ["-r", "-c", "AGXDeviceUserClient", "-w0", "-d1"])
+        let own = getpid()
+        let pids = Set(matches(#""IOUserClientCreator" = "pid (\d+),"#, io).compactMap { Int32($0) })
+            .filter { $0 != own }
+        guard !pids.isEmpty else { return [] }
+        let list = pids.map(String.init).joined(separator: ",")
+
+        var weights: [Int32: [String]] = [:]
+        var cur: Int32?
+        for line in run("/usr/sbin/lsof", ["-nP", "-w", "-F", "pn", "-p", list]).split(separator: "\n") {
+            if line.hasPrefix("p") { cur = Int32(line.dropFirst()); continue }
+            guard let pid = cur, line.hasPrefix("n") else { continue }
+            let path = String(line.dropFirst())
+            if path.hasSuffix(".safetensors") || path.hasSuffix(".gguf") || path.hasSuffix(".mlpackage") {
+                weights[pid, default: []].append(path)
+            }
+        }
+        guard !weights.isEmpty else { return [] }
+
+        let now = Date().timeIntervalSince1970
+        var out: [LocalProc] = []
+        let ps = run("/bin/ps", ["-o", "pid=,etime=,args=", "-p",
+                                 weights.keys.map(String.init).joined(separator: ",")])
+        for line in ps.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard f.count == 3, let pid = Int32(f[0]), let paths = weights[pid] else { continue }
+            let args = String(f[2])
+            // Déjà affichés dans leur propre bloc, avec leur TTL.
+            if args.contains("Ollama.app") || args.contains("LM Studio") || args.contains(".lmstudio") { continue }
+            let a = args.lowercased()
+            let engine = a.contains("mlx") || a.contains("mflux") ? "MLX"
+                : a.contains("llama") ? "llama.cpp"
+                : a.contains("draw things") ? "Draw Things"
+                : a.contains("torch") ? "PyTorch" : "Metal"
+            let words = args.split(separator: " ").map(String.init)
+            let script = words.first { $0.hasSuffix(".py") }
+            let program = URL(fileURLWithPath: script ?? words[0]).lastPathComponent
+            out.append(LocalProc(pid: pid, model: modelName(paths), engine: engine,
+                                 program: program, started: now - seconds(String(f[1]))))
+        }
+        return out.sorted { $0.started < $1.started }
     }
 }
 
@@ -1205,7 +1328,8 @@ final class LocalCounter {
             // On se lie explicitement à 127.0.0.1 : le compteur ne doit JAMAIS être
             // joignable depuis le réseau, il relaie un service local sans auth.
             params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
-            guard let l = try? NWListener(using: params, on: port) else {
+            // Pas de `on: port` : combiné à requiredLocalEndpoint, il lève EINVAL.
+            guard let l = try? NWListener(using: params) else {
                 Fetcher.dbg("compteur local \(rt.rawValue) : port \(rt.counterPort) indisponible")
                 continue
             }
@@ -1267,6 +1391,16 @@ enum LocalRuntimes {
     struct Reading {
         var detected: [LocalRuntime] = []
         var loaded: [LocalRuntime: [String]] = [:]
+        var expiry: [LocalRuntime: [String: Double]] = [:]
+    }
+
+    /// `expires_at` d'Ollama : ISO 8601 avec fractions de seconde et fuseau.
+    private static func parseDate(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
     }
 
     /// Appel synchrone et bref — on tourne déjà sur une file de fond, et un runtime
@@ -1297,6 +1431,12 @@ enum LocalRuntimes {
                 // `/api/ps` ne liste QUE les modèles résidents en mémoire.
                 let models = (obj["models"] as? [[String: Any]]) ?? []
                 r.loaded[rt] = models.compactMap { $0["name"] as? String }
+                for m in models {
+                    if let n = m["name"] as? String, let e = m["expires_at"] as? String,
+                       let d = parseDate(e) {
+                        r.expiry[rt, default: [:]][n] = d.timeIntervalSince1970
+                    }
+                }
             case .lmstudio:
                 if let obj = get(rt) {
                     r.detected.append(rt)
@@ -1646,6 +1786,27 @@ enum UI {
         return String(format: "%.0f", n)
     }
 
+    /// Temps restant avant qu'un modèle local soit déchargé de la mémoire.
+    /// Ollama renvoie une date à des siècles pour `keep_alive: -1` → « ∞ ».
+    static func localTTL(_ expiry: Double?, now: Date = Date()) -> String {
+        guard let expiry else { return "⏳ —" }
+        let left = Int(expiry - now.timeIntervalSince1970)
+        if left > 365 * 86_400 { return "⏳ ∞" }
+        if left <= 0 { return I18n.t("⏳ unloading", "⏳ déchargement") }
+        if left >= 3600 { return String(format: "⏳ %d h %02d", left / 3600, (left % 3600) / 60) }
+        if left >= 60 { return String(format: "⏳ %d min %02d", left / 60, left % 60) }
+        return "⏳ \(left) s"
+    }
+
+    /// Durée écoulée compacte : « 42 s », « 7 min », « 10 h 53 », « 2 j 4 h ».
+    static func elapsed(_ s: Double) -> String {
+        let t = Int(max(0, s))
+        if t >= 86_400 { return "\(t / 86_400) j \((t % 86_400) / 3600) h" }
+        if t >= 3600 { return String(format: "%d h %02d", t / 3600, (t % 3600) / 60) }
+        if t >= 60 { return "\(t / 60) min" }
+        return "\(t) s"
+    }
+
     static func humanCost(_ c: Double, decimals: Int = 0) -> String {
         "$" + String(format: "%.\(decimals)f", c)
     }
@@ -1730,6 +1891,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let menu = NSMenu()
     var timer: Timer?
     var resetTimer: Timer?
+    /// Décompte des TTL locaux, actif seulement menu ouvert.
+    var localTick: Timer?
+    var localTimer: Timer?
+    var menuOpen = false
+    var pendingLocalRebuild = false
+    var localProbing = false
+    /// Lignes redessinées chaque seconde menu ouvert (TTL, GPU), sans reconstruire le menu.
+    var liveRows: [(field: NSTextField, render: () -> NSAttributedString)] = []
     var lastUpdate: Date?
     var lastUsage: Usage?
     var lastFetchAt: Date?
@@ -1778,9 +1947,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resetTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             if let u = self?.lastUsage { ResetWatcher.process(u) }
         }
+        // Partie locale (TTL, GPU) : relevé léger (~0,15 s) pour que le menu s'ouvre à jour.
+        localTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            if self?.menuOpen == false { self?.refreshLocal() }
+        }
     }
 
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        refresh()
+        refreshLocal()
+        var ticks = 0
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            ticks += 1
+            // Jamais de reconstruction menu ouvert (il clignote) : on réécrit les lignes
+            // vivantes sur place, et on re-sonde toutes les 5 s.
+            if ticks % 5 == 0 { self.refreshLocal() }
+            for r in self.liveRows { r.field.attributedStringValue = r.render() }
+        }
+        RunLoop.main.add(t, forMode: .common)   // .common : tourne pendant le suivi du menu
+        localTick = t
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        localTick?.invalidate()
+        localTick = nil
+        if pendingLocalRebuild, let u = lastUsage {
+            pendingLocalRebuild = false
+            rebuildMenu(usage: u)
+        }
+    }
+
+    /// Ce qui change la FORME de la section locale (lignes en plus / en moins).
+    private func localShape(_ u: Usage) -> String {
+        let loaded = (u.localLoaded ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
+        let counted = (u.localByRuntime ?? [:]).sorted { $0.key < $1.key }
+            .map { "\($0.key):\($0.value.keys.sorted())" }
+        let procs = (u.localProcs ?? []).map { "\($0.pid)\($0.model)" }
+        return "\(u.localDetected ?? [])|\(loaded)|\(counted)|\(procs)"
+    }
+
+    /// Relit SEULEMENT la partie locale (Ollama / LM Studio / GPU, sans réseau sortant).
+    func refreshLocal() {
+        guard var u = lastUsage, !localProbing else { return }
+        localProbing = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            u.localDetected = nil; u.localLoaded = nil; u.localExpiry = nil
+            u.localGPU = nil; u.localProcs = nil
+            Fetcher.readLocal(into: &u)
+            DispatchQueue.main.async {
+                self.localProbing = false
+                guard var cur = self.lastUsage else { return }
+                let before = self.localShape(cur)
+                cur.localDetected = u.localDetected
+                cur.localLoaded = u.localLoaded
+                cur.localExpiry = u.localExpiry
+                cur.localByRuntime = u.localByRuntime
+                cur.localGPU = u.localGPU
+                cur.localProcs = u.localProcs
+                self.lastUsage = cur
+                if self.localShape(cur) == before { return }   // les lignes vivantes suffisent
+                if self.menuOpen { self.pendingLocalRebuild = true } else { self.rebuildMenu(usage: cur) }
+            }
+        }
+    }
 
     // MARK: Réseau
 
@@ -2315,21 +2547,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func localItems(_ u: Usage) -> [NSMenuItem] {
         let detected = (u.localDetected ?? []).compactMap { LocalRuntime(rawValue: $0) }
         let counted = u.localByRuntime ?? [:]
-        guard !detected.isEmpty || !counted.isEmpty else { return [] }
+        let procs = u.localProcs ?? []
+        guard !detected.isEmpty || !counted.isEmpty || !procs.isEmpty else { return [] }
 
         let para = NSMutableParagraphStyle()
         para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
 
-        /// Ligne « libellé … valeur », valeur alignée à droite.
-        func row(_ label: String, _ value: String, indent: CGFloat,
-                 size: CGFloat, color: NSColor) -> NSMenuItem {
+        func attr(_ label: String, _ value: String, size: CGFloat, color: NSColor) -> NSAttributedString {
             let s = NSMutableAttributedString(string: label, attributes: [
                 .font: NSFont.systemFont(ofSize: size), .foregroundColor: color,
                 .paragraphStyle: para])
             s.append(NSAttributedString(string: "\t" + value, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular),
                 .foregroundColor: color, .paragraphStyle: para]))
-            return self.displayItem(s, indent: indent)
+            return s
+        }
+
+        /// Ligne « libellé … valeur », valeur alignée à droite.
+        func row(_ label: String, _ value: String, indent: CGFloat,
+                 size: CGFloat, color: NSColor) -> NSMenuItem {
+            self.displayItem(attr(label, value, size: size, color: color), indent: indent)
+        }
+
+        /// Ligne redessinée chaque seconde menu ouvert ; `value` relit `lastUsage`.
+        func liveRow(_ label: String, indent: CGFloat, size: CGFloat, color: NSColor,
+                     value: @escaping (Usage) -> String) -> NSMenuItem {
+            let render: () -> NSAttributedString = { [weak self] in
+                attr(label, (self?.lastUsage).map(value) ?? "", size: size, color: color)
+            }
+            let item = self.displayItem(attr(label, value(u), size: size, color: color), indent: indent)
+            if let f = item.view?.subviews.first as? NSTextField { self.liveRows.append((f, render)) }
+            return item
         }
 
         func note(_ text: String, indent: CGFloat = 16) -> NSMenuItem {
@@ -2364,15 +2612,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   + UI.humanTokens(models.values.reduce(0.0) { $0 + $1.total })
             items.append(row(name, value, indent: 28, size: 11, color: .secondaryLabelColor))
 
-            for (model, use) in models.sorted(by: { $0.value.total > $1.value.total }).prefix(4) {
-                items.append(row(model, "\(use.requests) req  ·  \(UI.humanTokens(use.total))",
-                                 indent: 44, size: 10, color: .tertiaryLabelColor))
+            // Un modèle par ligne : chargés d'abord (temps restant avant déchargement),
+            // puis ceux comptés aujourd'hui mais déjà sortis de la mémoire.
+            let loaded = u.localLoaded?[rt.rawValue] ?? []
+            let rest = models.keys.filter { !loaded.contains($0) }
+                .sorted { models[$0]!.total > models[$1]!.total }
+            for model in (loaded + rest).prefix(6) {
+                let isLoaded = loaded.contains(model)
+                let key = rt.rawValue
+                items.append(liveRow(model, indent: 44, size: 10,
+                                     color: isLoaded ? .secondaryLabelColor : .tertiaryLabelColor) { u in
+                    var parts: [String] = []
+                    if isLoaded { parts.append(UI.localTTL(u.localExpiry?[key]?[model])) }
+                    parts.append((u.localByRuntime?[key]?[model]).map { UI.humanTokens($0.total) + " tok" } ?? "0 tok")
+                    return parts.joined(separator: "  ·  ")
+                })
             }
-            // Rien de compté mais un modèle en mémoire : dire ce qui tourne évite de
-            // laisser croire que la détection a échoué.
-            if models.isEmpty, let loaded = u.localLoaded?[rt.rawValue], !loaded.isEmpty {
-                items.append(note(I18n.t("loaded: ", "chargé : ") + loaded.prefix(2).joined(separator: ", "),
-                                  indent: 44))
+        }
+
+        // GPU : occupation globale, puis les modèles qui tournent HORS Ollama / LM Studio
+        // (scripts MLX, llama.cpp…), avec leur programme et depuis quand.
+        if u.localGPU != nil || !procs.isEmpty {
+            items.append(liveRow("GPU", indent: 28, size: 11, color: .secondaryLabelColor) { u in
+                u.localGPU.map { String(format: "%.0f %%", $0) } ?? "—"
+            })
+            for p in procs {
+                items.append(liveRow(p.model, indent: 44, size: 10, color: .secondaryLabelColor) { _ in
+                    "\(p.engine)  ·  " + UI.elapsed(Date().timeIntervalSince1970 - p.started)
+                })
+                items.append(note("\(p.program) · pid \(p.pid)", indent: 56))
             }
         }
 
@@ -2399,6 +2667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                      errorMessage: String? = nil, noticeMessage: String? = nil,
                      offlineCost: Double? = nil) {
         menu.removeAllItems()
+        liveRows.removeAll()
         menu.addItem(headerItem())
         menu.addItem(.separator())
 
@@ -2583,8 +2852,14 @@ if CommandLine.arguments.contains("--local") {
               + (up ? "en ligne sur \(rt.upstreamBase)" : "absent (\(rt.upstreamBase))")
               + "   compteur → \(rt.counterBase)  [\(rt.clientHint)]")
         if let loaded = u.localLoaded?[rt.rawValue], !loaded.isEmpty {
-            print("              chargé : " + loaded.joined(separator: ", "))
+            for m in loaded {
+                print("              chargé : \(m)  \(UI.localTTL(u.localExpiry?[rt.rawValue]?[m]))")
+            }
         }
+    }
+    print("GPU         : " + (u.localGPU.map { String(format: "%.0f %%", $0) } ?? "—"))
+    for p in u.localProcs ?? [] {
+        print("              \(p.model)  [\(p.engine)]  \(p.program) · pid \(p.pid) · depuis \(UI.elapsed(Date().timeIntervalSince1970 - p.started))")
     }
     let day = LocalUsage.today()
     if day.runtimes.isEmpty {
