@@ -1332,7 +1332,20 @@ enum Ccusage {
         return nil
     }
 
-    private static func run(_ args: [String]) -> [String: Any]? {
+    /// Dossiers Codex lus par ccusage : `~/.codex` (ou $CODEX_HOME) + le registre des runs
+    /// `codex exec --ephemeral`, que Codex n'enregistre pas et que le shim `codex-shim`
+    /// écrit au même format dans `~/.codex-ephemeral`. ccusage accepte une liste séparée par
+    /// des virgules et tarife les deux de la même façon.
+    private static func codexHomes() -> String {
+        let env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var dirs = [env["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? home + "/.codex"]
+        let ledger = env["CODEX_EPHEMERAL_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? home + "/.codex-ephemeral"
+        if FileManager.default.fileExists(atPath: ledger) { dirs.append(ledger) }
+        return dirs.joined(separator: ",")
+    }
+
+    private static func run(_ args: [String], extraEnv: [String: String] = [:]) -> [String: Any]? {
         guard let bin = binary() else { return nil }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
@@ -1345,6 +1358,7 @@ enum Ccusage {
         let extra = [(bin as NSString).deletingLastPathComponent, "/opt/homebrew/bin", "/usr/local/bin"]
             .joined(separator: ":")
         env["PATH"] = extra + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        env.merge(extraEnv) { $1 }
         p.environment = env
         let out = Pipe()
         p.standardOutput = out
@@ -1410,7 +1424,9 @@ enum Ccusage {
 
         // Codex (OpenAI) — coût + tokens du jour. Clé de coût = `costUSD` (≠ `totalCost`
         // côté Claude). Sous-commande absente sur les vieilles ccusage → champs nil.
-        if let obj = run(["codex", "daily", "--since", dayString(0), "--json"]),
+        // Runs `--ephemeral` compris (cf. `codexHomes`).
+        if let obj = run(["codex", "daily", "--since", dayString(0), "--json"],
+                         extraEnv: ["CODEX_HOME": codexHomes()]),
            let daily = obj["daily"] as? [[String: Any]] {
             func sum(_ k: String) -> Double { daily.reduce(0.0) { $0 + (num($1[k]) ?? 0) } }
             d.codexTodayCost = sum("costUSD")
@@ -1585,7 +1601,18 @@ enum CodexLimits {
         return f.date(from: s)?.timeIntervalSince1970
     }
 
-    static func read() -> Snapshot {
+    /// Une fenêtre dont l'heure de reset connue est déjà passée a FORCÉMENT été
+    /// réinitialisée (le serveur applique le reset à l'heure dite, que Codex ait tourné
+    /// ou non pendant ce temps) : on l'affiche à 0 % plutôt que de garder le vieux relevé,
+    /// qui deviendrait trompeur — barre encore proche de la limite, ligne « reset … »
+    /// figée sur « maintenant » indéfiniment. Le prochain reset est inconnu tant qu'un
+    /// nouvel appel Codex ne l'a pas redonné, d'où `resetsAt: nil`.
+    private static func freshened(_ limit: Limit?, now: Date) -> Limit? {
+        guard let l = limit, let r = l.resetsAt, r <= now else { return limit }
+        return Limit(utilization: 0, resetsAt: nil)
+    }
+
+    static func read(now: Date = Date()) -> Snapshot {
         var readings: [Reading] = []
         for url in recentSessionFiles(8) { readings += cliReadings(url) }   // source CLI
         if let r = appReading() { readings.append(r) }                      // source app
@@ -1598,8 +1625,8 @@ enum CodexLimits {
         if let ref = readings
             .filter({ $0.fiveHourUsed != nil || $0.weeklyUsed != nil })
             .max(by: { $0.epoch < $1.epoch }) {
-            if let u = ref.fiveHourUsed { snap.fiveHour = Limit(utilization: u, resetsAt: ref.fiveHourReset) }
-            if let u = ref.weeklyUsed { snap.sevenDay = Limit(utilization: u, resetsAt: ref.weeklyReset) }
+            snap.fiveHour = freshened(ref.fiveHourUsed.map { Limit(utilization: $0, resetsAt: ref.fiveHourReset) }, now: now)
+            snap.sevenDay = freshened(ref.weeklyUsed.map { Limit(utilization: $0, resetsAt: ref.weeklyReset) }, now: now)
             snap.asOf = Date(timeIntervalSince1970: ref.epoch)
         }
         snap.plan = readings.filter { $0.plan != nil }.max(by: { $0.epoch < $1.epoch })?.plan

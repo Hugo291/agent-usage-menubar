@@ -257,6 +257,17 @@ split needs no hardcoded prices: it distributes the known total using price *rat
   `cache_write_input_tokens` counter, but it reads 0 in practice and `ccusage`'s Codex parser
   never looks at it — so no write cost enters the total being split.
 
+**`codex exec --ephemeral` runs.** `--ephemeral` stops Codex from writing its session file, so
+`ccusage` never sees those tokens and they count as $0. The optional `codex-shim` fixes that:
+installed ahead of the real `codex` in your `PATH`, it steps aside for every other command, and
+for `--ephemeral` runs it records each turn's usage, in Codex's own session format, under
+`~/.codex-ephemeral` (a folder Codex doesn't list in its history). The widget adds that folder
+to what `ccusage` reads, so those runs are priced like any other.
+
+```bash
+install -m 755 codex-shim ~/.local/bin/codex   # ~/.local/bin must come before the real codex in PATH
+```
+
 Note the **Claude cost reflects Claude Code (CLI)
 usage only** — Claude Desktop chats aren't logged locally, so they aren't counted here (the
 **quota %**, being server-side, still covers everything).

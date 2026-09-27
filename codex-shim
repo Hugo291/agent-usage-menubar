@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Shim `codex` — compte l'usage des `codex exec --ephemeral`.
+
+`--ephemeral` empêche Codex d'écrire son fichier de session : ccusage (qui ne lit que ces
+fichiers) ne voit donc jamais ces tokens, et le widget affiche $0 pour ces runs.
+
+Installé AVANT le vrai `codex` dans le PATH (ex. ~/.local/bin/codex), ce shim :
+  - sans `--ephemeral` → remplace son processus par le vrai `codex`, rien ne change ;
+  - avec `--ephemeral` → lance le vrai `codex` en `--json`, restitue la sortie habituelle
+    (message final sur stdout, déroulé + erreurs sur stderr, même code de retour) et
+    écrit l'usage de chaque tour au FORMAT SESSION de Codex dans ~/.codex-ephemeral
+    (dossier que Codex n'affiche pas dans son historique). Le widget passe
+    CODEX_HOME=~/.codex,~/.codex-ephemeral à ccusage, qui tarife ces tokens comme les autres.
+
+Toute erreur du shim lui-même est avalée : il ne doit jamais faire échouer un run Codex.
+"""
+import datetime, json, os, re, signal, subprocess, sys, tempfile, uuid
+
+LEDGER = os.path.expanduser(os.environ.get("CODEX_EPHEMERAL_HOME", "~/.codex-ephemeral"))
+CHILD = None  # le vrai `codex`, une fois lancé : ne JAMAIS le relancer une seconde fois
+
+
+def real_codex():
+    """Le premier `codex` du PATH qui n'est pas ce script."""
+    me = os.path.realpath(__file__)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, "codex")
+        if os.access(p, os.X_OK) and os.path.realpath(p) != me:
+            return p
+    return "/opt/homebrew/bin/codex"
+
+
+def option(args, *names):
+    """Valeur d'une option (`-m x`, `--model x`, `--model=x`), sinon None."""
+    for i, a in enumerate(args):
+        for n in names:
+            if a == n and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(n + "="):
+                return a[len(n) + 1:]
+    return None
+
+
+def model_of(args):
+    m = option(args, "-m", "--model")
+    if m:
+        return m
+    for i, a in enumerate(args):  # -c model="x"
+        if a in ("-c", "--config") and i + 1 < len(args):
+            k = re.match(r'\s*model\s*=\s*"?([^"]+)"?\s*$', args[i + 1])
+            if k:
+                return k.group(1)
+    if "--ignore-user-config" not in args:
+        try:
+            cfg = open(os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")), "config.toml")).read()
+            k = re.search(r'(?m)^model\s*=\s*"([^"]+)"', cfg)
+            if k:
+                return k.group(1)
+        except OSError:
+            pass
+    return "unknown"
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def write_ledger(thread_id, model, cwd, turns):
+    """Une session au format rollout de Codex : ccusage lit `turn_context` (modèle) et
+    `event_msg`/`token_count` (`info.last_token_usage`)."""
+    if not turns:
+        return
+    t0 = datetime.datetime.now(datetime.timezone.utc)
+    day = os.path.join(LEDGER, "sessions", t0.strftime("%Y"), t0.strftime("%m"), t0.strftime("%d"))
+    os.makedirs(day, exist_ok=True)
+    tid = thread_id or str(uuid.uuid4())
+    path = os.path.join(day, f"rollout-{t0.strftime('%Y-%m-%dT%H-%M-%S')}-{tid}.jsonl")
+    lines = [
+        {"timestamp": turns[0][0], "type": "session_meta",
+         "payload": {"id": tid, "timestamp": turns[0][0], "cwd": cwd, "originator": "codex-shim (ephemeral)"}},
+        {"timestamp": turns[0][0], "type": "turn_context", "payload": {"cwd": cwd, "model": model}},
+    ]
+    total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+             "reasoning_output_tokens": 0, "total_tokens": 0}
+    for ts, u in turns:
+        last = {
+            "input_tokens": int(u.get("input_tokens") or 0),
+            "cached_input_tokens": int(u.get("cached_input_tokens") or 0),
+            "output_tokens": int(u.get("output_tokens") or 0),
+            "reasoning_output_tokens": int(u.get("reasoning_output_tokens") or 0),
+        }
+        # Comme dans les sessions de Codex : cached ⊂ input et reasoning ⊂ output.
+        last["total_tokens"] = last["input_tokens"] + last["output_tokens"]
+        for k in total:
+            total[k] += last[k]
+        lines.append({"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": last, "total_token_usage": dict(total), "model": model}}})
+    with open(path, "w") as f:
+        for l in lines:
+            f.write(json.dumps(l, ensure_ascii=False) + "\n")
+
+
+def say(*parts):
+    print(*parts, file=sys.stderr, flush=True)
+
+
+def main(args):
+    real = real_codex()
+    if "--ephemeral" not in args:
+        os.execv(real, [real] + args)
+
+    user_json = "--json" in args
+    out_file = option(args, "-o", "--output-last-message")
+    tmp = None
+    run_args = list(args)
+    if not user_json:
+        run_args.append("--json")
+        if out_file is None:
+            fd, tmp = tempfile.mkstemp(prefix="codex-shim-", suffix=".txt")
+            os.close(fd)
+            run_args += ["-o", tmp]
+
+    global CHILD
+    child = CHILD = subprocess.Popen([real] + run_args, stdout=subprocess.PIPE, text=True, bufsize=1)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda s, _f: child.send_signal(s))
+
+    model = model_of(args)
+    cwd = option(args, "-C", "--cd") or os.getcwd()
+    thread_id, turns, last_msg, total = None, [], None, 0
+    for line in child.stdout:
+        if user_json:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            if not user_json:
+                sys.stderr.write(line)
+            continue
+        t = ev.get("type")
+        if t == "thread.started":
+            thread_id = ev.get("thread_id")
+        elif t == "turn.completed" and isinstance(ev.get("usage"), dict):
+            turns.append((now(), ev["usage"]))
+            total += int(ev["usage"].get("input_tokens") or 0) + int(ev["usage"].get("output_tokens") or 0)
+        if user_json:
+            continue
+        # Déroulé lisible sur stderr, à la manière du mode normal de `codex exec`.
+        item = ev.get("item") or {}
+        if t == "item.completed" and item.get("type") == "agent_message":
+            last_msg = item.get("text", "")
+            say("codex\n" + last_msg)
+        elif t == "item.completed" and item.get("type") == "command_execution":
+            say("exec\n" + str(item.get("command", "")) + f"\n(exit {item.get('exit_code')})")
+        elif t == "item.completed" and item.get("type") == "file_change":
+            say("file update: " + ", ".join(c.get("path", "") for c in item.get("changes", [])))
+        elif t == "item.completed" and item.get("type") == "error":
+            say("warning: " + str(item.get("message", "")))
+        elif t == "error":
+            say("ERROR: " + str(ev.get("message", "")))
+        elif t == "turn.failed":
+            say("ERROR: " + str((ev.get("error") or {}).get("message", "")))
+    code = child.wait()
+
+    if not user_json:
+        if total:
+            say(f"tokens used\n{total:,}".replace(",", " "))
+        final = None
+        try:
+            final = open(tmp or out_file).read()
+        except (OSError, TypeError):
+            final = last_msg
+        if final:
+            sys.stdout.write(final if final.endswith("\n") else final + "\n")
+            sys.stdout.flush()
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    try:
+        write_ledger(thread_id, model, cwd, turns)
+    except Exception as e:  # le comptage ne doit jamais casser le run
+        say(f"codex-shim: usage non enregistré ({e})")
+    return code
+
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    try:
+        sys.exit(main(argv))
+    except SystemExit:
+        raise
+    except Exception:
+        if CHILD is None:  # rien lancé : on s'efface derrière le vrai `codex`
+            real = real_codex()
+            os.execv(real, [real] + argv)
+        sys.exit(CHILD.wait())
