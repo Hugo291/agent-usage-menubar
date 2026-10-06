@@ -92,7 +92,6 @@ swiftc -O -swift-version 5 \
     "$SRC_DIR/ClaudeUsage.swift" \
     -o "$STAGE/Contents/MacOS/$APP_NAME" \
     -framework Cocoa \
-    -framework Network \
     -framework UserNotifications \
     -framework WidgetKit
 
@@ -176,6 +175,9 @@ codesign --force --sign - "$STAGE" 2>/dev/null || true
 # Install into ~/Applications (so it keeps working even if you move/delete this repo).
 mkdir -p "$INSTALL_DIR"
 pkill -f "$APP_NAME.app/Contents/MacOS" 2>/dev/null || true
+# Stop the old extension too: a suspended widget can survive app replacement.
+# Its archived views carry the old bundle version and chronod rejects them.
+pkill -f "$APP_NAME.app/Contents/PlugIns/$WIDGET_NAME.appex/Contents/MacOS/$WIDGET_NAME" 2>/dev/null || true
 rm -rf "$APP"
 mv "$STAGE" "$APP"
 rm -rf "$(dirname "$STAGE")"
@@ -185,6 +187,9 @@ ok "Installed → $APP"
 # extension never shows up in the widget gallery.
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 [ -x "$LSREG" ] && "$LSREG" -f "$APP" 2>/dev/null || true
+if [ -d "$APP/Contents/PlugIns/$WIDGET_NAME.appex" ]; then
+  /usr/bin/pluginkit -a "$APP/Contents/PlugIns/$WIDGET_NAME.appex" 2>/dev/null || true
+fi
 
 # ----------------------------------------------------- auto-start at login ---
 say "Enabling auto-start at login…"

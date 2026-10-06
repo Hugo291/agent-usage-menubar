@@ -39,9 +39,6 @@ enum I18n {
 /// l'autre et on garde son quota sous les yeux sans ouvrir le menu.
 enum BarProvider: String, CaseIterable {
     case claude, codex, ollama
-    /// Modèles locaux (Ollama local + LM Studio) : ni quota ni facture, donc la barre
-    /// montre ce qui existe vraiment — les tokens du jour et le nombre de requêtes.
-    case local
     /// Cumul : la barre ne montre que le coût TOTAL du jour (Claude + Codex). Les
     /// pourcentages, eux, ne se cumulent pas (deux ressources distinctes : 70 % de
     /// Claude + 78 % de Codex ne veut rien dire) → ils restent dans le menu déroulant.
@@ -53,7 +50,6 @@ enum BarProvider: String, CaseIterable {
         case .claude: return "Claude"
         case .codex:  return "Codex"
         case .ollama: return "Ollama"
-        case .local:  return I18n.t("Local models", "Modèles locaux")
         case .total:  return I18n.t("Total cost", "Coût cumulé")
         }
     }
@@ -84,6 +80,219 @@ enum TokenBreakdownPref {
         UserDefaults.standard.set(on, forKey: key)
     }
     static func toggle() { set(!enabled) }
+}
+
+enum DetailedMenuStyle: String, CaseIterable {
+    case normal, compact, ultra, folded
+    static var current: DetailedMenuStyle {
+        DetailedMenuStyle(rawValue: UserDefaults.standard.string(forKey: "detailedMenuStyle") ?? "compact") ?? .compact
+    }
+    var title: String {
+        switch self {
+        case .normal: return I18n.t("Normal (full details)", "Normal (détails complets)")
+        case .compact: return I18n.t("Balanced compact", "Compact équilibré")
+        case .ultra: return I18n.t("Ultra-lines", "Ultra-lignes")
+        case .folded: return I18n.t("Expandable compact", "Compact dépliable")
+        }
+    }
+}
+
+enum ContentPref {
+    static var hidden: [String] { UserDefaults.standard.stringArray(forKey: "hiddenProviderSections") ?? [] }
+    static func visible(_ id: String) -> Bool { !hidden.contains(id) }
+    static func setVisible(_ id: String, _ visible: Bool) {
+        var list = hidden.filter { $0 != id }
+        if !visible { list.append(id) }
+        UserDefaults.standard.set(list, forKey: "hiddenProviderSections")
+    }
+}
+
+// MARK: - Fournisseurs ajoutés dans l'app
+
+/// Les clés ne font jamais partie des préférences, du cache ou du flux du widget.
+struct AddedProvider: Codable {
+    var id = UUID().uuidString
+    var name: String
+    var url: String
+    var openRouter: Bool
+    var remainingPath: String = ""
+    var dailyCostPath: String = ""
+}
+
+struct ProviderReading: Codable {
+    var id: String
+    var name: String
+    var remaining: Double?
+    var dailyCost: Double?
+    var credit: Double?  // Budget restant de LA CLÉ, pas solde global du compte.
+    var dailyRequestsRemaining: Double?
+    var dailyRequestLimit: Double?
+    var error: String?
+}
+
+/// Aucun transfert automatique de la clé vers une URL de redirection.
+final class ProviderRedirectGuard: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+enum AddedProviders {
+    private static let prefsKey = "addedUsageProviders"
+    private static let service = "com.hugo.claudeusagewidget.provider-keys"
+    static var configs: [AddedProvider] {
+        guard let data = UserDefaults.standard.data(forKey: prefsKey) else { return [] }
+        return (try? JSONDecoder().decode([AddedProvider].self, from: data)) ?? []
+    }
+    static var readings: [ProviderReading] = []  // Main thread only.
+    static func save(_ configs: [AddedProvider]) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(configs), forKey: prefsKey)
+    }
+    static func key(_ id: String) -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecAttrAccount as String: id,
+            kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    @discardableResult static func storeKey(_ key: String?, id: String) -> OSStatus {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecAttrAccount as String: id]
+        guard let key = key else { return SecItemDelete(q as CFDictionary) }
+        let value = [kSecValueData as String: Data(key.utf8)]
+        let status = SecItemUpdate(q as CFDictionary, value as CFDictionary)
+        if status != errSecItemNotFound { return status }
+        return SecItemAdd(q.merging(value) { _, new in new } as CFDictionary, nil)
+    }
+    /// Lecture ciblée : jamais d'énumération des secrets des autres fournisseurs.
+    static func importOpenRouter() -> String? {
+        var secret: String?
+        for name in ["OPENROUTER_API_KEY", "OPENROUTER_KEY", "OR_API_KEY"] {
+            if let value = ProcessInfo.processInfo.environment[name], !value.isEmpty { secret = value; break }
+        }
+        if secret == nil {
+            let base = ProcessInfo.processInfo.environment["XDG_DATA_HOME"].map { URL(fileURLWithPath: $0) }
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share")
+            let path = base.appendingPathComponent("opencode/auth.json")
+            if let data = try? Data(contentsOf: path),
+               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let entry = root["openrouter"] as? [String: Any], entry["type"] as? String == "api" {
+                secret = entry["key"] as? String
+            }
+        }
+        guard let key = secret?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+              !key.contains(where: { $0.isWhitespace }) else {
+            return I18n.t("No OpenRouter API key found in the environment or OpenCode.", "Aucune clé API OpenRouter trouvée dans l'environnement ou OpenCode.")
+        }
+        var list = configs
+        let existing = list.firstIndex { $0.openRouter }
+        let provider = existing.map { list[$0] } ?? AddedProvider(name: "OpenRouter", url: "https://openrouter.ai/api/v1/key", openRouter: true)
+        let status = storeKey(key, id: provider.id)
+        guard status == errSecSuccess else {
+            return I18n.t("Keychain import failed (\(status)).", "Échec de l'import dans le Trousseau (\(status)).")
+        }
+        if existing == nil { list.append(provider) }
+        save(list)
+        return nil
+    }
+
+    static func validURL(_ text: String, openRouter: Bool) -> URL? {
+        guard let url = URL(string: text), url.scheme?.lowercased() == "https",
+              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
+              url.query == nil, url.fragment == nil else { return nil }
+        if openRouter && (host.lowercased() != "openrouter.ai" || url.path != "/api/v1/key" || (url.port != nil && url.port != 443)) { return nil }
+        return url
+    }
+    /// Chemin JSON simple, p.ex. data.remaining_percent (pas de JSONPath implicite).
+    static func number(_ object: Any, path: String) -> Double? {
+        guard !path.isEmpty else { return nil }
+        var value = object
+        for part in path.split(separator: ".", omittingEmptySubsequences: false) {
+            guard let dict = value as? [String: Any], let next = dict[String(part)] else { return nil }
+            value = next
+        }
+        if let n = value as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
+        let n = (value as? NSNumber)?.doubleValue ?? (value as? String).flatMap(Double.init)
+        return n.flatMap { $0.isFinite ? $0 : nil }
+    }
+    static func parse(_ object: Any, provider p: AddedProvider) -> ProviderReading {
+        var r = ProviderReading(id: p.id, name: p.name)
+        if p.openRouter {
+            r.dailyCost = number(object, path: "data.usage_daily")
+            r.credit = number(object, path: "data.limit_remaining")
+            r.dailyRequestLimit = number(object, path: "data.free_model_daily_requests.limit")
+            r.dailyRequestsRemaining = number(object, path: "data.free_model_daily_requests.remaining")
+            if let limit = r.dailyRequestLimit, limit > 0, let requests = r.dailyRequestsRemaining,
+               !(0...limit).contains(requests) {
+                r.error = I18n.t("Invalid daily request quota", "Quota quotidien de requêtes invalide")
+            }
+            if let cap = number(object, path: "data.limit"), cap > 0, let credit = r.credit {
+                r.remaining = max(0, min(100, credit / cap * 100))
+            }
+        } else {
+            r.remaining = number(object, path: p.remainingPath)
+            r.dailyCost = number(object, path: p.dailyCostPath)
+            if (!p.remainingPath.isEmpty && r.remaining == nil) || (!p.dailyCostPath.isEmpty && r.dailyCost == nil) {
+                r.error = I18n.t("JSON field missing or not numeric", "Champ JSON absent ou non numérique")
+            }
+        }
+        if let n = r.dailyRequestsRemaining, n < 0 { r.error = I18n.t("Invalid daily request quota", "Quota quotidien de requêtes invalide") }
+        if let n = r.remaining, !(0...100).contains(n) { r.error = I18n.t("Remaining quota must be 0–100", "Quota restant attendu entre 0 et 100") }
+        if let n = r.dailyCost, n < 0 { r.error = I18n.t("Invalid daily cost", "Coût du jour invalide") }
+        if r.remaining == nil && r.dailyCost == nil && r.credit == nil
+            && r.dailyRequestsRemaining == nil && r.error == nil {
+            r.error = I18n.t("No supported usage data", "Aucune donnée de consommation reconnue")
+        }
+        if r.error != nil {
+            r.remaining = nil; r.dailyCost = nil; r.credit = nil
+            r.dailyRequestsRemaining = nil; r.dailyRequestLimit = nil
+        }
+        return r
+    }
+    /// Exécuté en arrière-plan : GET uniquement, sans génération facturable.
+    static func read(_ p: AddedProvider) -> ProviderReading {
+        var failure = ProviderReading(id: p.id, name: p.name)
+        guard let url = validURL(p.url, openRouter: p.openRouter) else {
+            failure.error = I18n.t("Invalid HTTPS URL", "URL HTTPS invalide"); return failure
+        }
+        guard let key = key(p.id), !key.isEmpty else {
+            failure.error = I18n.t("API key missing or inaccessible", "Clé API absente ou inaccessible"); return failure
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForResource = 12
+        let session = URLSession(configuration: config, delegate: ProviderRedirectGuard(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let semaphore = DispatchSemaphore(value: 0)
+        var reading = failure
+        let task = session.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+            if error != nil { reading.error = I18n.t("Network error", "Erreur réseau"); return }
+            guard let http = response as? HTTPURLResponse else { reading.error = "HTTP"; return }
+            guard http.statusCode == 200 else {
+                reading.error = http.statusCode == 401 || http.statusCode == 403
+                    ? I18n.t("API key refused (HTTP \(http.statusCode))", "Clé API refusée (HTTP \(http.statusCode))") : "HTTP \(http.statusCode)"
+                return
+            }
+            guard let data = data, let obj = try? JSONSerialization.jsonObject(with: data) else {
+                reading.error = I18n.t("Invalid JSON response", "Réponse JSON invalide"); return
+            }
+            reading = parse(obj, provider: p)
+        }
+        task.resume()
+        guard semaphore.wait(timeout: .now() + 13) == .success else {
+            task.cancel(); failure.error = I18n.t("Request timed out", "Délai dépassé"); return failure
+        }
+        return reading
+    }
 }
 
 // MARK: - Ventilation du coût par type de token
@@ -192,20 +401,17 @@ enum WidgetFeed {
         limit("ollamaWeek", u.ollamaWeekly)
         put("ollamaCost4w", u.ollamaCost4w)
         put("ollamaPlan", u.ollamaPlan)
+        put("ollamaAsOf", u.ollamaAsOf?.timeIntervalSince1970)
+        put("ollamaError", u.ollamaError)
+        d["ollamaSessionInactive"] = u.ollamaSessionInactive ?? false
+        d["hiddenProviders"] = ContentPref.hidden
+        if let data = try? JSONEncoder().encode(AddedProviders.readings.filter { ContentPref.visible($0.id) }),
+           let rows = try? JSONSerialization.jsonObject(with: data) { d["addedProviders"] = rows }
         // Tokens du jour par fournisseur, pour le graphe de répartition du widget.
         // Ollama en est ABSENT à dessein : son API ne publie que des `request_count`,
         // pas des tokens — les mêler fausserait les pourcentages.
         put("claudeTokens", u.todayTokens)
         put("codexTokens", u.codexTodayTokens)
-        // Modèles locaux : tokens et requêtes du jour. Ils ne rejoignent NI le coût
-        // total NI la barre de répartition — celle-ci compare des tokens facturés,
-        // et y mêler des tokens gratuits en fausserait la lecture.
-        put("localTokens", u.localTokens)
-        if let r = u.localRequests { d["localRequests"] = r }
-        if let by = u.localByRuntime {
-            let names = by.keys.compactMap { LocalRuntime(rawValue: $0)?.displayName }.sorted()
-            if !names.isEmpty { d["localNames"] = names }
-        }
         put("totalCost", u.totalTodayCost)
         put("projectedCost", u.totalTodayCost.map { UI.projectedCost(spentSoFar: $0) })
         // Ventilation par type de token, déjà calculée et localisée ici : l'extension
@@ -272,6 +478,9 @@ struct Usage: Codable {
     var ollamaSession: Limit?
     var ollamaWeekly: Limit?
     var ollamaPlan: String?
+    var ollamaAsOf: Date?
+    var ollamaError: String?
+    var ollamaSessionInactive: Bool?
     /// Coût Ollama sur les 4 DERNIÈRES SEMAINES (c'est la période que l'API renvoie,
     /// pas la journée) → à afficher tel quel, JAMAIS à additionner au total du jour.
     var ollamaCost4w: Double?
@@ -318,6 +527,7 @@ struct Usage: Codable {
 
 enum FetchResult {
     case ok(Usage)
+    case partial(Usage, String) // Claude indisponible, autres fournisseurs actualisés
     case authError          // token absent / expiré → reconnecter Claude Code
     case error(String)
 }
@@ -351,7 +561,15 @@ enum Cache {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
-        return try? dec.decode(CachedUsage.self, from: data)
+        guard var cached = try? dec.decode(CachedUsage.self, from: data) else { return nil }
+        // Migration : les anciennes versions avaient inventé des resets Ollama.
+        cached.usage.ollamaSession?.resetsAt = nil
+        cached.usage.ollamaWeekly?.resetsAt = nil
+        if cached.usage.ollamaAsOf == nil && (cached.usage.ollamaSession != nil || cached.usage.ollamaWeekly != nil) {
+            cached.usage.ollamaSession = nil; cached.usage.ollamaWeekly = nil
+            cached.usage.ollamaError = I18n.t("Awaiting a verified reading", "En attente d'un relevé vérifié")
+        }
+        return cached
     }
 }
 
@@ -670,39 +888,10 @@ enum Fetcher {
         dbg("local détectés=\(probe.detected.map { $0.rawValue }) tokens=\(String(describing: u.localTokens)) requêtes=\(String(describing: u.localRequests))")
     }
 
-    static func fetch(_ completion: @escaping (FetchResult) -> Void) {
-        DispatchQueue.global().async {
+    static func fetch(previous: Usage? = nil, _ completion: @escaping (FetchResult) -> Void) {        DispatchQueue.global().async {
             func done(_ r: FetchResult) { DispatchQueue.main.async { completion(r) } }
 
-            dbg("préparation du token (lecture trousseau / refresh si expiré)…")
-            guard let token = Auth.ensureToken() else {
-                dbg("aucun token exploitable (ni valide, ni rafraîchissable)")
-                done(.authError); return
-            }
-
-            dbg("token prêt, requête /usage…")
-            var (code, obj, errMsg) = callUsage(token)
-
-            // Token rejeté malgré tout : on force un refresh puis on réessaie une fois.
-            if code == 401 || code == 403 {
-                dbg("401/403 → refresh forcé + nouvel essai")
-                if let cred = Auth.readCredential(), let t2 = Auth.refresh(cred) {
-                    (code, obj, errMsg) = callUsage(t2)
-                }
-            }
-
-            dbg("réponse /usage (code=\(code), err=\(String(describing: errMsg)))")
-            if let e = errMsg, code < 0 { done(.error(e)); return }          // vrai échec réseau
-            if code == 401 || code == 403 { done(.authError); return }
-            guard code == 200, let obj = obj else { done(.error("HTTP \(code)")); return }
-
-            var u = Usage()
-            u.fiveHour = limit(from: obj["five_hour"])
-            u.sevenDay = limit(from: obj["seven_day"])
-            u.sevenDaySonnet = limit(from: obj["seven_day_sonnet"])
-            u.sevenDayOpus = limit(from: obj["seven_day_opus"])
-            u.claudePlan = Auth.subscriptionType()
-
+            var u = previous ?? Usage()
             dbg("lecture ccusage (Claude + Codex)…")
             let c = Ccusage.read()
             u.todayCost = c.todayCost
@@ -728,17 +917,49 @@ enum Fetcher {
             dbg("codex quotas 5h=\(String(describing: cl.fiveHour?.remaining)) hebdo=\(String(describing: cl.sevenDay?.remaining)) plan=\(String(describing: cl.plan))")
 
             // Quotas Ollama Cloud (optionnels : seulement si une clé est configurée).
+            u.ollamaSession = nil; u.ollamaWeekly = nil; u.ollamaCost4w = nil
+            u.ollamaError = nil; u.ollamaAsOf = nil; u.ollamaSessionInactive = nil
             if let ol = OllamaLimits.read() {
                 u.ollamaSession = ol.session
                 u.ollamaWeekly = ol.weekly
                 u.ollamaCost4w = ol.cost4w
                 u.ollamaPlan = ol.plan
+                u.ollamaError = ol.error
+                u.ollamaSessionInactive = ol.sessionInactive
+                if ol.error == nil { u.ollamaAsOf = Date() }
                 dbg("ollama session=\(String(describing: ol.session?.remaining)) hebdo=\(String(describing: ol.weekly?.remaining))")
             }
 
             // Modèles locaux : détection (toujours) + compteurs du jour (s'il y en a).
             readLocal(into: &u)
 
+            dbg("préparation du token (lecture trousseau / refresh si expiré)…")
+            guard let token = Auth.ensureToken() else {
+                dbg("aucun token exploitable (ni valide, ni rafraîchissable)")
+                done(.partial(u, I18n.t("Claude session expired. Sign back in to Claude.", "Session Claude expirée. Reconnecte-toi à Claude."))); return
+            }
+
+            dbg("token prêt, requête /usage…")
+            var (code, obj, errMsg) = callUsage(token)
+
+            // Token rejeté malgré tout : on force un refresh puis on réessaie une fois.
+            if code == 401 || code == 403 {
+                dbg("401/403 → refresh forcé + nouvel essai")
+                if let cred = Auth.readCredential(), let t2 = Auth.refresh(cred) {
+                    (code, obj, errMsg) = callUsage(t2)
+                }
+            }
+
+            dbg("réponse /usage (code=\(code), err=\(String(describing: errMsg)))")
+            if let e = errMsg, code < 0 { done(.partial(u, e)); return }          // vrai échec réseau
+            if code == 401 || code == 403 { done(.partial(u, I18n.t("Claude session expired. Sign back in to Claude.", "Session Claude expirée. Reconnecte-toi à Claude."))); return }
+            guard code == 200, let obj = obj else { done(.partial(u, "HTTP \(code)")); return }
+
+            u.fiveHour = limit(from: obj["five_hour"])
+            u.sevenDay = limit(from: obj["seven_day"])
+            u.sevenDaySonnet = limit(from: obj["seven_day_sonnet"])
+            u.sevenDayOpus = limit(from: obj["seven_day_opus"])
+            u.claudePlan = Auth.subscriptionType()
             done(.ok(u))
         }
     }
@@ -758,7 +979,14 @@ enum Fetcher {
 ///    "limits":{"session":{"usage":1,…},"weekly":{"usage":0.094,…}}}
 /// `usage` est une FRACTION CONSOMMÉE (0–1), pas un pourcentage : 1 = quota épuisé.
 enum OllamaLimits {
-    struct Reading { var session: Limit?; var weekly: Limit?; var cost4w: Double?; var plan: String? }
+    struct Reading {
+        var session: Limit?
+        var weekly: Limit?
+        var cost4w: Double?
+        var plan: String?
+        var error: String?
+        var sessionInactive = false
+    }
 
     static var keyPath: String { NSHomeDirectory() + "/.ollama/widget-key" }
 
@@ -795,6 +1023,40 @@ enum OllamaLimits {
         return cachedPlan
     }
 
+    /// N'infère jamais les resets depuis la période d'activité (qui couvre 4 semaines).
+    static func parse(_ root: [String: Any]) -> Reading {
+        var r = Reading()
+        guard let limits = root["limits"] as? [String: Any] else {
+            r.error = I18n.t("Usage format not supported", "Format de consommation non pris en charge")
+            return r
+        }
+        func window(_ name: String) -> Limit? {
+            guard let w = limits[name] as? [String: Any],
+                  let used = AddedProviders.number(w, path: "usage"), (0...1).contains(used) else { return nil }
+            // L'API fournit une fraction CONSOMMÉE. Les jauges montrent le RESTANT.
+            return Limit(utilization: used * 100,
+                         resetsAt: Fetcher.parseDate(w["resets_at"] as? String))
+        }
+        r.session = window("session")
+        r.weekly = window("weekly")
+        if let session = limits["session"] as? [String: Any],
+           let models = session["models"] as? [[String: Any]], models.isEmpty,
+           r.session?.utilization == 0 {
+            r.sessionInactive = true
+            r.session = nil  // Pas de jauge « pleine » pour une session non démarrée.
+        }
+        if r.session == nil && r.weekly == nil && !r.sessionInactive {
+            r.error = I18n.t("Quota data unavailable", "Quotas indisponibles")
+        }
+        if let activity = root["activity"] as? [String: Any],
+           let period = activity["period"] as? [String: Any],
+           period["type"] as? String == "last_4_weeks",
+           let cost = AddedProviders.number(activity, path: "cost"), cost >= 0 {
+            r.cost4w = cost
+        }
+        return r
+    }
+
     static func read() -> Reading? {
         guard let key = apiKey(),
               let url = URL(string: "https://ollama.com/api/usage") else { return nil }
@@ -810,97 +1072,19 @@ enum OllamaLimits {
             guard code == 200, let data = data,
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             else {
-                // 401 = clé invalide/révoquée. On n'affiche rien plutôt que des zéros.
+                let message = code == 401 || code == 403
+                    ? I18n.t("API key refused", "Clé API refusée")
+                    : I18n.t("Usage unavailable (HTTP \(code))", "Consommation indisponible (HTTP \(code))")
+                out = Reading(error: message)
                 Fetcher.dbg("ollama /api/usage → HTTP \(code)")
                 return
             }
-            func window(_ name: String) -> Limit? {
-                guard let lim = root["limits"] as? [String: Any],
-                      let w = lim[name] as? [String: Any],
-                      let used = w["usage"] as? Double else { return nil }
-                // fraction consommée → pourcentage d'utilisation, borné.
-                return Limit(utilization: max(0, min(1, used)) * 100, resetsAt: nil)
-            }
-            var r = Reading(session: window("session"), weekly: window("weekly"), cost4w: nil)
-            if let act = root["activity"] as? [String: Any] {
-                // `cost` arrive en CHAÎNE ("0.00000") — pas en nombre.
-                if let s = act["cost"] as? String { r.cost4w = Double(s) }
-                else if let d = act["cost"] as? Double { r.cost4w = d }
-                // L'API ne donne AUCUNE heure de reset. Mais `period.starting_at` est
-                // une FRONTIÈRE DE SEMAINE (vérifié : un lundi 00:00 UTC) : on s'en
-                // sert d'ancre et on avance de 7 j jusqu'à dépasser maintenant. On lit
-                // ainsi l'ancre chez Ollama plutôt que de coder « lundi » en dur.
-                if let per = act["period"] as? [String: Any],
-                   let anchor = Fetcher.parseDate(per["starting_at"] as? String),
-                   var w = r.weekly {
-                    let week: TimeInterval = 7 * 86_400
-                    let n = max(0, (Date().timeIntervalSince(anchor) / week).rounded(.down) + 1)
-                    w.resetsAt = anchor.addingTimeInterval(n * week)
-                    r.weekly = w
-                }
-            }
-            // Fenêtre « session » : ni durée ni reset publiés. On l'OBSERVE — quand la
-            // consommation retombe, c'est qu'un reset a eu lieu ; deux resets donnent la
-            // période, donc le suivant. Tant qu'on n'a pas vu deux cycles, pas de ligne.
-            if let sess = r.session {
-                r.session = SessionWatcher.track(sess)
-            }
-            out = (r.session == nil && r.weekly == nil) ? nil : r
+            out = parse(root)
         }.resume()
-        _ = sem.wait(timeout: .now() + 15)
+        if sem.wait(timeout: .now() + 15) != .success {
+            return Reading(error: I18n.t("Usage request timed out", "Délai de lecture de consommation dépassé"))
+        }
         if out != nil { out?.plan = plan(key) }
-        return out
-    }
-}
-
-/// La fenêtre « session » d'Ollama n'a ni durée ni reset publiés (vérifié : absents du
-/// corps, des en-têtes, et même de la réponse 429). On la déduit donc de l'OBSERVATION :
-/// à chaque relevé on note la consommation ; quand elle retombe nettement, c'est un
-/// reset. Deux resets donnent la période, donc la date du suivant. Avant ça, on n'invente
-/// rien — la ligne reste sans heure.
-enum SessionWatcher {
-    struct State: Codable { var lastUsage: Double?; var lastReset: Date?; var period: TimeInterval? }
-
-    private static var url: URL {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.hugo.claudeusagewidget", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("ollama-session.json")
-    }
-
-    private static func load() -> State {
-        guard let d = try? Data(contentsOf: url) else { return State() }
-        let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
-        return (try? dec.decode(State.self, from: d)) ?? State()
-    }
-
-    private static func save(_ st: State) {
-        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
-        try? enc.encode(st).write(to: url, options: .atomic)
-    }
-
-    static func track(_ limit: Limit) -> Limit {
-        var st = load()
-        var out = limit
-        let now = Date()
-        // Une BAISSE franche de la consommation = la fenêtre a été remise à zéro.
-        // Le seuil évite de prendre du bruit d'arrondi pour un reset.
-        if let prev = st.lastUsage, limit.utilization < prev - 5 {
-            if let previousReset = st.lastReset {
-                let delta = now.timeIntervalSince(previousReset)
-                if delta > 600 { st.period = delta }   // ignore deux relevés collés
-            }
-            st.lastReset = now
-        } else if st.lastReset == nil {
-            st.lastReset = now   // première observation : point de départ
-        }
-        st.lastUsage = limit.utilization
-        save(st)
-        if let last = st.lastReset, let p = st.period {
-            var next = last.addingTimeInterval(p)
-            while next < now { next = next.addingTimeInterval(p) }
-            out.resetsAt = next
-        }
         return out
     }
 }
@@ -1371,20 +1555,6 @@ final class LocalCounter {
     }
 }
 
-/// Activation du compteur local. Désactivé par défaut : ouvrir des ports, même sur
-/// la boucle locale, ne se fait pas dans le dos de l'utilisateur.
-enum LocalCounterPref {
-    private static let key = "widgetLocalCounter"
-    private(set) static var enabled: Bool = UserDefaults.standard.bool(forKey: key)
-
-    static func set(_ on: Bool) {
-        enabled = on
-        UserDefaults.standard.set(on, forKey: key)
-        LocalCounter.shared.apply(enabled: on)
-    }
-    static func toggle() { set(!enabled) }
-}
-
 /// Détection des runtimes locaux et de leurs modèles chargés. Indépendant du
 /// comptage : la section s'affiche dès qu'un runtime répond, même sans compteur.
 enum LocalRuntimes {
@@ -1456,7 +1626,6 @@ enum LocalRuntimes {
         return r
     }
 }
-
 // MARK: - Tokens consommés (via ccusage)
 
 enum Ccusage {
@@ -1648,7 +1817,10 @@ enum CodexLimits {
         let size = (try? h.seekToEnd()) ?? 0
         let tail: UInt64 = 1_000_000
         try? h.seek(toOffset: size > tail ? size - tail : 0)
-        guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) else { return [] }
+        guard let data = try? h.readToEnd() else { return [] }
+        // La queue peut commencer au milieu d’un caractère UTF-8 ; seule cette
+        // première ligne incomplète doit être ignorée, pas tout le relevé.
+        let text = String(decoding: data, as: UTF8.self)
         var out: [Reading] = []
         for line in text.split(separator: "\n") where line.contains("rate_limits") {
             guard let d = line.data(using: .utf8),
@@ -1656,10 +1828,10 @@ enum CodexLimits {
                   let ts = obj["timestamp"] as? String, let epoch = isoEpoch(ts),
                   let payload = obj["payload"] as? [String: Any],
                   let rl = payload["rate_limits"] as? [String: Any] else { continue }
+            if let id = rl["limit_id"] as? String, id != "codex" { continue }
             var r = Reading(epoch: epoch)
             // On classe chaque fenêtre par sa DURÉE (`window_minutes`), pas par sa
-            // position : Codex est passé d'un duo (primary=5 h, secondary=hebdo) à une
-            // SEULE fenêtre hebdomadaire placée dans `primary` (secondary=null) en 2026.
+            // position, qui peut varier selon le compte et le budget renvoyé.
             for key in ["primary", "secondary"] {
                 guard let w = rl[key] as? [String: Any],
                       let used = (w["used_percent"] as? NSNumber)?.doubleValue else { continue }
@@ -1760,7 +1932,7 @@ enum CodexLimits {
         var snap = Snapshot()
         // La lecture la plus FRAÎCHE qui porte au moins une fenêtre reflète la structure
         // ACTUELLE des quotas Codex. On ne montre QUE ses fenêtres : sinon un vieux relevé
-        // (d'avant que Codex ne supprime le 5 h, mi-2026) ferait réapparaître une fenêtre
+        // provenant d’une autre structure de limites ferait réapparaître une fenêtre
         // qui n'existe plus. Ça ignore aussi les events « crédits » à fenêtres nulles.
         if let ref = readings
             .filter({ $0.fiveHourUsed != nil || $0.weeklyUsed != nil })
@@ -1886,6 +2058,50 @@ enum UI {
 
 // MARK: - App
 
+/// Copie les lignes déjà rendues du vrai menu, sans déplacer ses vues ni ses actions.
+/// Un document retourné donne un aperçu défilable même avec beaucoup de fournisseurs.
+final class MenuPreviewDocument: NSView {
+    override var isFlipped: Bool { true }
+
+    init(items: [NSMenuItem]) {
+        let width = max(CGFloat(350), (items.compactMap { $0.view?.frame.width }.max() ?? 0) + 16)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 0))
+        var y: CGFloat = 8
+        for item in items {
+            if item.isSeparatorItem {
+                let line = NSBox(frame: NSRect(x: 14, y: y + 4, width: width - 28, height: 1))
+                line.boxType = .separator
+                addSubview(line)
+                y += 10
+            } else if let original = item.view {
+                let row = NSView(frame: NSRect(x: 8, y: y, width: width - 16, height: original.frame.height))
+                for field in original.subviews.compactMap({ $0 as? NSTextField }) {
+                    let copy = NSTextField(labelWithAttributedString: field.attributedStringValue)
+                    copy.frame = field.frame
+                    copy.isSelectable = false
+                    copy.toolTip = field.toolTip
+                    row.addSubview(copy)
+                }
+                row.toolTip = original.toolTip
+                addSubview(row)
+                y += row.frame.height
+            } else {
+                // Les commandes sont montrées comme dans le menu, mais non exécutables.
+                let title = item.title + (item.submenu == nil ? "" : "  ›")
+                let field = NSTextField(labelWithString: title)
+                field.font = NSFont.menuFont(ofSize: 13)
+                field.frame = NSRect(x: 24, y: y + 3, width: width - 48, height: 20)
+                addSubview(field)
+                y += 26
+            }
+        }
+        frame.size.height = y + 8
+        setAccessibilityLabel(I18n.t("Detailed menu preview", "Aperçu du menu détaillé"))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
@@ -1927,9 +2143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             WidgetFeed.publish(cached.usage, updated: cached.savedAt)
         }
         Notifier.shared.configure()   // délégué + demande d'autorisation des notifs
-        // Compteur des modèles locaux : rouvre les ports si l'option était active.
-        LocalCounter.shared.apply(enabled: LocalCounterPref.enabled)
-        // Re-teinte les icônes quand la barre bascule clair ↔ sombre.
+        // Comptage local automatique, y compris si une ancienne préférence le désactivait.
+        LocalCounter.shared.apply(enabled: true)        // Re-teinte les icônes quand la barre bascule clair ↔ sombre.
         appearanceObs = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
             if let u = self?.lastUsage { self?.updateTitle(u) }
         }
@@ -1946,6 +2161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // et même hors ligne. Bon marché → toutes les 60 s.
         resetTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             if let u = self?.lastUsage { ResetWatcher.process(u) }
+            self?.refreshCodexLimits()
         }
         // Partie locale (TTL, GPU) : relevé léger (~0,15 s) pour que le menu s'ouvre à jour.
         localTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
@@ -1955,6 +2171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
+        refreshCodexLimits()
         refresh()
         refreshLocal()
         var ticks = 0
@@ -1977,6 +2194,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if pendingLocalRebuild, let u = lastUsage {
             pendingLocalRebuild = false
             rebuildMenu(usage: u)
+        }
+    }
+
+    private var codexReading = false
+
+    /// Les journaux Codex sont locaux : leur lecture ne dépend ni de Claude ni du réseau.
+    private func refreshCodexLimits() {
+        guard !codexReading else { return }
+        codexReading = true
+        DispatchQueue.global().async {
+            let limits = CodexLimits.read()
+            DispatchQueue.main.async {
+                self.codexReading = false
+                guard var u = self.lastUsage else { return }
+                let changed = u.codexAsOf != limits.asOf
+                    || u.codexFiveHour?.utilization != limits.fiveHour?.utilization
+                    || u.codexSevenDay?.utilization != limits.sevenDay?.utilization
+                guard changed else { return }
+                u.codexFiveHour = limits.fiveHour
+                u.codexSevenDay = limits.sevenDay
+                u.codexPlan = limits.plan
+                u.codexAsOf = limits.asOf
+                self.lastUsage = u
+                Cache.save(u, at: self.lastUpdate ?? Date())
+                ResetWatcher.process(u)
+                WidgetFeed.publish(u, updated: self.lastUpdate ?? Date())
+                self.updateTitle(u)
+                if self.menuOpen { self.pendingLocalRebuild = true }
+                else { self.rebuildMenu(usage: u) }
+            }
         }
     }
 
@@ -2026,17 +2273,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let freshFor: TimeInterval = 300
 
     func doRefresh(force: Bool) {
+        refreshAddedProviders(force: force)
         let now = Date()
         if !force {
             // Chiffres encore frais → on n'appelle PAS le réseau, on garde l'affichage.
-            if let last = lastUpdate, now.timeIntervalSince(last) < freshFor { return }
+            if let last = lastUpdate, now.timeIntervalSince(last) < freshFor,
+               lastUsage?.ollamaError == nil { return }
             // Backoff : pas de fetch auto tant que la fenêtre de réessai n'est pas passée.
             if let next = nextAllowedFetch, now < next { return }
             // Garde-fou : deux déclencheurs quasi simultanés (lancement + ouverture).
             if let lf = lastFetchAt, now.timeIntervalSince(lf) < 15 { return }
         }
         lastFetchAt = now
-        Fetcher.fetch { [weak self] result in
+        Fetcher.fetch(previous: lastUsage) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .ok(let usage):
@@ -2049,6 +2298,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 WidgetFeed.publish(usage, updated: self.lastUpdate!)
                 self.updateTitle(usage)
                 self.rebuildMenu(usage: usage)
+            case .partial(let usage, let message):
+                self.backoff = self.backoff == 0 ? 60 : min(self.backoff * 2, 1800)
+                self.nextAllowedFetch = Date().addingTimeInterval(self.backoff)
+                self.lastUsage = usage
+                // Ne rajeunit pas les quotas Claude conservés depuis le cache.
+                Cache.save(usage, at: self.lastUpdate ?? Date())
+                ResetWatcher.process(usage)
+                WidgetFeed.publish(usage, updated: self.lastUpdate ?? Date())
+                self.updateTitle(usage)
+                self.rebuildMenu(usage: usage, noticeMessage: I18n.t(
+                    "Claude: \(message)", "Claude : \(message)"))
             case .authError:
                 self.statusItem.button?.attributedTitle = NSAttributedString(
                     string: "⚠︎ Claude",
@@ -2107,6 +2367,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func updateTitle(_ usage: Usage) {
+        defer { updatePreferencesPreview() }
+        if let id = UserDefaults.standard.string(forKey: "customBarProvider"),
+           let p = AddedProviders.configs.first(where: { $0.id == id }) {
+            let r = AddedProviders.readings.first { $0.id == id }
+            let value = r?.remaining.map { String(format: "%.0f%%", $0) }
+                ?? r?.dailyCost.map { UI.humanCost($0, decimals: 2) } ?? "—"
+            statusItem.button?.title = p.name + " " + (r?.error == nil ? value : "⚠︎")
+            return
+        }
         guard let button = statusItem.button else { return }
         let appearance = button.effectiveAppearance
         let mono = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
@@ -2140,8 +2409,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             segment(symbol: "calendar", fallback: "7j", limit: usage.sevenDay)
         }
         func codexSegments() {
-            if let f = usage.codexFiveHour {          // Codex n'a plus de 5 h depuis 2026,
-                segment(symbol: "hourglass", fallback: "5h", limit: f)   // mais on gère
+            if let f = usage.codexFiveHour {          // Affiche la fenêtre courte quand elle existe,
+                segment(symbol: "hourglass", fallback: "5h", limit: f)
                 gap()
             }
             segment(symbol: "calendar", fallback: "7j", limit: usage.codexSevenDay)
@@ -2159,6 +2428,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             codexSegments()
             cost = usage.codexTodayCost
         case .ollama:
+            if usage.ollamaError != nil {
+                s.append(NSAttributedString(string: "Ollama ⚠︎", attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
+                cost = nil
+                break
+            }
             // Le coût Ollama porte sur 4 semaines, pas sur la journée : on n'en met
             // AUCUN dans la barre, qui parle du jour partout ailleurs.
             if usage.ollamaSession != nil {
@@ -2166,28 +2440,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 gap()
             }
             segment(symbol: "calendar", fallback: "7j", limit: usage.ollamaWeekly)
-            cost = nil
-        case .local:
-            // Ni quota ni facture côté local : la barre montre ce qui existe
-            // réellement — les tokens du jour, et le nombre de requêtes.
-            if let img = iconImage("cpu", color: .labelColor, appearance: appearance) {
-                let att = NSTextAttachment()
-                att.image = img
-                let h = img.size.height
-                att.bounds = CGRect(x: 0, y: (mono.capHeight - h) / 2,
-                                    width: img.size.width, height: h)
-                s.append(NSAttributedString(attachment: att))
-                s.append(NSAttributedString(string: " ", attributes: [.font: mono]))
-            } else {
-                s.append(NSAttributedString(string: "loc ", attributes: [
-                    .font: mono, .foregroundColor: NSColor.labelColor]))
-            }
-            s.append(NSAttributedString(string: usage.localTokens.map { UI.humanTokens($0) } ?? "—",
-                attributes: [.font: mono, .foregroundColor: NSColor.labelColor]))
-            if let r = usage.localRequests {
-                s.append(NSAttributedString(string: "   \(r) req", attributes: [
-                    .font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
-            }
             cost = nil
         case .total:
             cost = usage.totalTodayCost   // pas de quotas : seul l'argent s'additionne
@@ -2320,27 +2572,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Une fenêtre de quota : ligne compacte (icône + libellé · barre fine · « X% »),
     /// puis, en dessous, l'heure de reset (jour + heure + temps relatif). Colonnes
     /// alignées par tabulations.
-    private func compactQuota(symbol: String, label: String, limit: Limit?) -> [NSMenuItem] {
+    private func compactQuota(symbol: String, label: String, limit: Limit?, toolTip: String? = nil) -> [NSMenuItem] {
+        let compact = DetailedMenuStyle.current == .compact
         let para = NSMutableParagraphStyle()
         para.tabStops = [NSTextTab(textAlignment: .left, location: 60),
-                         NSTextTab(textAlignment: .right, location: 244)]
+                         NSTextTab(textAlignment: .right, location: compact ? 180 : 244)]
+        if compact { para.tabStops.append(NSTextTab(textAlignment: .right, location: 300)) }
         let s = NSMutableAttributedString(attributedString: rowIcon(symbol))
         s.append(NSAttributedString(string: " " + label, attributes: [
             .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
         if let l = limit {
             let color = UI.color(forRemaining: l.remaining)
             s.append(NSAttributedString(string: "\t"))
-            s.append(barAttachment(remaining: l.remaining, color: color))
+            s.append(barAttachment(remaining: l.remaining, color: color, width: compact ? 80 : 150))
             s.append(NSAttributedString(string: "\t" + String(format: "%.0f%%", l.remaining), attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color]))
         } else {
             s.append(NSAttributedString(string: "\t" + I18n.t("unlimited", "non plafonné"), attributes: [
                 .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
         }
+        if compact, let reset = limit?.resetsAt {
+            let short = UI.resetText(reset).components(separatedBy: " · ").last ?? ""
+            s.append(NSAttributedString(string: "\t↻ " + short, attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]))
+        }
         s.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: s.length))
 
-        var out = [displayItem(s, indent: 16)]
-        if let l = limit, l.resetsAt != nil {
+        var out = [displayItem(s, indent: 16,
+                               toolTip: toolTip ?? limit?.resetsAt.map { UI.resetText($0) })]
+        if !compact, let l = limit, l.resetsAt != nil {
             out.append(displayItem(NSAttributedString(string: UI.resetText(l.resetsAt), attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
                 .foregroundColor: NSColor.tertiaryLabelColor]), indent: 40))
@@ -2372,42 +2631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              .foregroundColor: NSColor.tertiaryLabelColor]), indent: 14))
         }
         items.append(.separator())
-
-        // Sous-menu : quel fournisseur afficher dans la barre de menus.
-        let barItem = NSMenuItem(title: I18n.t("Menu bar", "Barre de menus"), action: nil, keyEquivalent: "")
-        let barMenu = NSMenu()
-        for p in BarProvider.allCases {
-            let it = NSMenuItem(title: p.menuTitle, action: #selector(changeBarProvider(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = p.rawValue
-            it.state = (p == BarPref.current) ? .on : .off
-            barMenu.addItem(it)
-        }
-        barItem.submenu = barMenu
-        items.append(barItem)
-
-        // Bascule : ventilation du coût par type de token, affichée en permanence.
-        let breakdownItem = NSMenuItem(
-            title: I18n.t("Show cost by token type", "Coût par type de token"),
-            action: #selector(toggleTokenBreakdown), keyEquivalent: "")
-        breakdownItem.target = self
-        breakdownItem.state = TokenBreakdownPref.enabled ? .on : .off
-        items.append(breakdownItem)
-
-        // Bascule : compteur des modèles locaux (ouvre/ferme les ports d'écoute).
-        let localItem = NSMenuItem(
-            title: I18n.t("Count local models", "Compter les modèles locaux"),
-            action: #selector(toggleLocalCounter), keyEquivalent: "")
-        localItem.target = self
-        localItem.state = LocalCounterPref.enabled ? .on : .off
-        localItem.toolTip = I18n.t(
-            "Listens on 127.0.0.1:\(LocalRuntime.ollama.counterPort) (Ollama) and "
-            + "127.0.0.1:\(LocalRuntime.lmstudio.counterPort) (LM Studio) and forwards to the real "
-            + "runtime, counting tokens as they go by. Point your client at that address to be counted.",
-            "Écoute sur 127.0.0.1:\(LocalRuntime.ollama.counterPort) (Ollama) et "
-            + "127.0.0.1:\(LocalRuntime.lmstudio.counterPort) (LM Studio), renvoie au vrai runtime et "
-            + "compte les tokens au passage. Pointe ton client sur cette adresse pour être compté.")
-        items.append(localItem)
+        let preferences = NSMenuItem(title: I18n.t("Preferences…", "Préférences…"), action: #selector(openPreferences), keyEquivalent: ",")
+        preferences.target = self
+        items.append(preferences)
 
         // Sous-menu de langue.
         let langItem = NSMenuItem(title: I18n.t("Language", "Langue"), action: nil, keyEquivalent: "")
@@ -2431,11 +2657,389 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openPreferences()
+        return true
+    }
+
+    private var preferencesWindow: NSWindow?
+    private var preferencesPreview: NSTextField?
+    private var detailedPreviewScroll: NSScrollView?
+    private var preferencesPreviewTimer: Timer?
+
+    private func updateDetailedMenuPreview() {
+        guard preferencesWindow?.isVisible == true, let scroll = detailedPreviewScroll else { return }
+        // Les jauges locales utilisent les mêmes closures que les lignes du vrai menu.
+        for row in liveRows { row.field.attributedStringValue = row.render() }
+        let offset = scroll.contentView.bounds.origin
+        let document = MenuPreviewDocument(items: menu.items)
+        scroll.documentView = document
+        scroll.contentView.scroll(to: NSPoint(x: offset.x,
+            y: min(offset.y, max(0, document.frame.height - scroll.contentSize.height))))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+
+    private func updatePreferencesPreview() {
+        guard let button = statusItem.button, let preview = preferencesPreview else { return }
+        preview.attributedStringValue = button.attributedTitle
+        preview.appearance = button.effectiveAppearance
+    }
+
+    @objc private func openPreferences() {
+        if let window = preferencesWindow, window.isVisible {
+            NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil); return
+        }
+        buildPreferences()
+    }
+
+    private func buildPreferences() {
+        let oldOrigin = preferencesWindow?.frame.origin
+        preferencesPreviewTimer?.invalidate()
+        preferencesWindow?.close()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = I18n.t("Agent Usage — Preferences", "Agent Usage — Préférences")
+        window.isReleasedWhenClosed = false
+        preferencesWindow = window
+        let configs = AddedProviders.configs
+        let height = CGFloat(max(680, 550 + configs.count * 38))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 920, height: 680))
+        window.contentView = content
+        let previewTitle = NSTextField(labelWithString: I18n.t("Detailed menu — live preview", "Menu détaillé — aperçu en direct"))
+        previewTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        previewTitle.frame = NSRect(x: 546, y: 641, width: 350, height: 22)
+        content.addSubview(previewTitle)
+        let background = NSVisualEffectView(frame: NSRect(x: 540, y: 20, width: 360, height: 609))
+        background.material = .menu
+        background.blendingMode = .withinWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 10
+        background.layer?.masksToBounds = true
+        content.addSubview(background)
+        let detailScroll = NSScrollView(frame: background.bounds)
+        detailScroll.hasVerticalScroller = true
+        detailScroll.hasHorizontalScroller = true
+        detailScroll.autohidesScrollers = true
+        detailScroll.drawsBackground = false
+        background.addSubview(detailScroll)
+        detailedPreviewScroll = detailScroll
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 680))
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        let document = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: height))
+        scroll.documentView = document
+        content.addSubview(scroll)
+        var y = height - 36
+        func label(_ text: String, bold: Bool = false) {
+            let field = NSTextField(labelWithString: text)
+            field.frame = NSRect(x: 24, y: y, width: 460, height: 22)
+            field.font = NSFont.systemFont(ofSize: bold ? 13 : 11, weight: bold ? .semibold : .regular)
+            document.addSubview(field); y -= 30
+        }
+        label(I18n.t("Live menu-bar preview", "Aperçu en direct de la barre de menus"), bold: true)
+        let bar = NSBox(frame: NSRect(x: 24, y: y - 18, width: 450, height: 46))
+        bar.boxType = .custom
+        bar.cornerRadius = 8; bar.fillColor = .windowBackgroundColor
+        bar.borderColor = .separatorColor
+        bar.appearance = statusItem.button?.effectiveAppearance
+        let preview = NSTextField(labelWithString: "")
+        preview.frame = NSRect(x: 16, y: 12, width: 418, height: 22)
+        preview.alignment = .center
+        bar.contentView?.addSubview(preview)
+        preferencesPreview = preview
+        document.addSubview(bar)
+        updatePreferencesPreview()
+        y -= 42
+        label(I18n.t("Detailed menu always visible on the right →", "Menu détaillé toujours visible à droite →"))
+        y -= 23
+        label(I18n.t("Menu-bar indicator", "Indicateur dans la barre de menus"), bold: true)
+        let popup = NSPopUpButton(frame: NSRect(x: 24, y: y, width: 450, height: 26))
+        for p in BarProvider.allCases {
+            popup.addItem(withTitle: p.menuTitle); popup.lastItem?.representedObject = p.rawValue
+        }
+        for p in configs {
+            popup.addItem(withTitle: p.name); popup.lastItem?.representedObject = "custom:" + p.id
+        }
+        let selected = UserDefaults.standard.string(forKey: "customBarProvider").map { "custom:" + $0 } ?? BarPref.current.rawValue
+        if let item = popup.itemArray.first(where: { ($0.representedObject as? String) == selected }) { popup.select(item) }
+        popup.target = self; popup.action = #selector(preferenceBarChanged(_:))
+        document.addSubview(popup); y -= 40
+        label(I18n.t("Detailed menu version", "Version du menu détaillé"), bold: true)
+        let style = NSPopUpButton(frame: NSRect(x: 24, y: y, width: 450, height: 26))
+        for mode in DetailedMenuStyle.allCases {
+            style.addItem(withTitle: mode.title); style.lastItem?.representedObject = mode.rawValue
+        }
+        style.selectItem(at: DetailedMenuStyle.allCases.firstIndex(of: DetailedMenuStyle.current) ?? 0)
+        style.target = self; style.action = #selector(preferenceMenuStyleChanged(_:))
+        document.addSubview(style); y -= 40
+        label(I18n.t("Sections shown in the menu", "Sections affichées dans le menu"), bold: true)
+        for (id, title) in [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama"), ("local", I18n.t("Local models", "Modèles locaux"))] {
+            let box = NSButton(checkboxWithTitle: title, target: self, action: #selector(preferenceVisibilityChanged(_:)))
+            box.identifier = NSUserInterfaceItemIdentifier(id)
+            box.state = ContentPref.visible(id) ? .on : .off
+            box.frame = NSRect(x: 24, y: y, width: 450, height: 22)
+            document.addSubview(box); y -= 27
+        }
+        let tokens = NSButton(checkboxWithTitle: I18n.t("Show cost by token type", "Afficher le coût par type de token"), target: self, action: #selector(preferenceTokensChanged(_:)))
+        tokens.state = TokenBreakdownPref.enabled ? .on : .off
+        tokens.frame = NSRect(x: 24, y: y, width: 450, height: 22)
+        document.addSubview(tokens); y -= 37
+        label(I18n.t("Additional providers", "Fournisseurs supplémentaires"), bold: true)
+        for p in configs {
+            let box = NSButton(checkboxWithTitle: p.name, target: self, action: #selector(preferenceVisibilityChanged(_:)))
+            box.identifier = NSUserInterfaceItemIdentifier(p.id)
+            box.state = ContentPref.visible(p.id) ? .on : .off
+            box.frame = NSRect(x: 24, y: y, width: 240, height: 24)
+            document.addSubview(box)
+            for (x, title, action) in [(CGFloat(277), I18n.t("Edit…", "Modifier…"), #selector(preferenceEdit(_:))),
+                                       (CGFloat(379), I18n.t("Remove…", "Supprimer…"), #selector(preferenceRemove(_:)))] {
+                let button = NSButton(title: title, target: self, action: action)
+                button.bezelStyle = .rounded
+                button.identifier = NSUserInterfaceItemIdentifier(p.id)
+                button.frame = NSRect(x: x, y: y, width: 100, height: 27)
+                document.addSubview(button)
+            }
+            y -= 38
+        }
+        let add = NSButton(title: I18n.t("+ Add a provider…", "+ Ajouter un fournisseur…"), target: self, action: #selector(addProvider))
+        add.bezelStyle = .rounded; add.frame = NSRect(x: 24, y: y, width: 240, height: 30)
+        document.addSubview(add)
+        y -= 36
+        let importKey = NSButton(title: I18n.t("Import OpenRouter (environment / OpenCode)", "Importer OpenRouter (env. / OpenCode)"), target: self, action: #selector(importOpenRouter))
+        importKey.bezelStyle = .rounded
+        importKey.frame = NSRect(x: 24, y: y, width: 360, height: 30)
+        document.addSubview(importKey)
+        if let origin = oldOrigin { window.setFrameOrigin(origin) } else { window.center() }
+        document.scroll(NSPoint(x: 0, y: height))
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        rebuildMenu(usage: lastUsage ?? Usage())
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] timer in
+            guard let self = self, self.preferencesWindow?.isVisible == true else { timer.invalidate(); return }
+            self.refreshLocal()
+            self.updateDetailedMenuPreview()
+        }
+        preferencesPreviewTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func preferenceMenuStyleChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String else { return }
+        UserDefaults.standard.set(raw, forKey: "detailedMenuStyle")
+        publishPreferences()
+    }
+    @objc private func importOpenRouter() {
+        if let error = AddedProviders.importOpenRouter() { providerMessage(error); return }
+        refreshAddedProviders(force: true)
+        buildPreferences()
+    }
+
+    private func publishPreferences() {
+        let u = lastUsage ?? Usage()
+        updateTitle(u)
+        rebuildMenu(usage: u)
+        WidgetFeed.publish(u, updated: lastUpdate ?? Date())
+    }
+    @objc private func preferenceVisibilityChanged(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        ContentPref.setVisible(id, sender.state == .on)
+        publishPreferences()
+    }
+    @objc private func preferenceTokensChanged(_ sender: NSButton) {
+        TokenBreakdownPref.set(sender.state == .on); publishPreferences()
+    }
+    @objc private func preferenceBarChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String else { return }
+        if raw.hasPrefix("custom:") {
+            UserDefaults.standard.set(String(raw.dropFirst(7)), forKey: "customBarProvider")
+        } else if let p = BarProvider(rawValue: raw) {
+            UserDefaults.standard.removeObject(forKey: "customBarProvider")
+            BarPref.set(p)
+        }
+        publishPreferences()
+    }
+    @objc private func preferenceEdit(_ sender: NSButton) {
+        let item = NSMenuItem(); item.representedObject = sender.identifier?.rawValue
+        editProvider(item)
+    }
+    @objc private func preferenceRemove(_ sender: NSButton) {
+        let item = NSMenuItem(); item.representedObject = sender.identifier?.rawValue
+        removeProvider(item)
+    }
+
+    private var addedRefreshAt: Date?
+    private var addedGeneration = 0
+
+    private func refreshAddedProviders(force: Bool) {
+        if !force, let date = addedRefreshAt, Date().timeIntervalSince(date) < 300 { return }
+        addedRefreshAt = Date()
+        addedGeneration += 1
+        let generation = addedGeneration
+        let configs = AddedProviders.configs
+        let ids = Set(configs.map { $0.id })
+        AddedProviders.readings.removeAll { !ids.contains($0.id) }
+        for p in configs {
+            DispatchQueue.global(qos: .utility).async {
+                let reading = AddedProviders.read(p)
+                DispatchQueue.main.async {
+                    guard self.addedGeneration == generation else { return }
+                    AddedProviders.readings.removeAll { $0.id == p.id }
+                    AddedProviders.readings.append(reading)
+                    AddedProviders.readings.sort { a, b in
+                        (configs.firstIndex { $0.id == a.id } ?? 0) < (configs.firstIndex { $0.id == b.id } ?? 0)
+                    }
+                    let usage = self.lastUsage ?? Usage()
+                    self.updateTitle(usage)
+                    WidgetFeed.publish(usage, updated: self.lastUpdate ?? Date())
+                    if self.menuOpen { self.pendingLocalRebuild = true }
+                    else { self.rebuildMenu(usage: usage) }
+                }
+            }
+        }
+    }
+
+    private func providerMessage(_ text: String) {
+        let alert = NSAlert()
+        alert.messageText = I18n.t("Provider settings", "Configuration du fournisseur")
+        alert.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc private func addProvider() {
+        let choice = NSAlert()
+        choice.messageText = I18n.t("Add a provider", "Ajouter un fournisseur")
+        choice.informativeText = I18n.t("OpenRouter is preconfigured. Other APIs need a JSON usage endpoint with Bearer authentication.", "OpenRouter est préconfiguré. Les autres API nécessitent un endpoint de consommation JSON avec authentification Bearer.")
+        choice.addButton(withTitle: "OpenRouter")
+        choice.addButton(withTitle: I18n.t("Custom API", "API personnalisée"))
+        choice.addButton(withTitle: I18n.t("Cancel", "Annuler"))
+        NSApp.activate(ignoringOtherApps: true)
+        let answer = choice.runModal()
+        guard answer != .alertThirdButtonReturn else { return }
+        showProviderEditor(nil, openRouter: answer == .alertFirstButtonReturn)
+    }
+
+    @objc private func editProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let p = AddedProviders.configs.first(where: { $0.id == id }) else { return }
+        showProviderEditor(p, openRouter: p.openRouter)
+    }
+
+    @objc private func removeProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let p = AddedProviders.configs.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = I18n.t("Remove \(p.name)?", "Supprimer \(p.name) ?")
+        alert.informativeText = I18n.t("Its saved API key will also be deleted from Keychain.", "Sa clé API sera également supprimée du Trousseau.")
+        alert.addButton(withTitle: I18n.t("Cancel", "Annuler"))
+        alert.addButton(withTitle: I18n.t("Remove", "Supprimer"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        let status = AddedProviders.storeKey(nil, id: id)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            providerMessage(I18n.t("Cannot delete Keychain item (\(status)).", "Impossible de supprimer la clé du Trousseau (\(status)).")); return
+        }
+        AddedProviders.save(AddedProviders.configs.filter { $0.id != id })
+        ContentPref.setVisible(id, true)
+        if UserDefaults.standard.string(forKey: "customBarProvider") == id { UserDefaults.standard.removeObject(forKey: "customBarProvider") }
+        if preferencesWindow?.isVisible == true { buildPreferences() }
+        AddedProviders.readings.removeAll { $0.id == id }
+        refreshAddedProviders(force: true)
+        let usage = lastUsage ?? Usage()
+        rebuildMenu(usage: usage)
+        WidgetFeed.publish(usage, updated: lastUpdate ?? Date())
+    }
+
+    private func showProviderEditor(_ existing: AddedProvider?, openRouter: Bool) {
+        let alert = NSAlert()
+        alert.messageText = existing == nil ? I18n.t("Add provider", "Ajouter un fournisseur") : I18n.t("Edit provider", "Modifier le fournisseur")
+        alert.informativeText = openRouter
+            ? I18n.t("Paste a standard OpenRouter API key. Shows daily spend and the key's remaining budget (if capped), not account balance.", "Colle une clé API OpenRouter standard. Affiche la dépense du jour et le budget restant de la clé (si plafonnée), pas le solde du compte.")
+            : I18n.t("GET JSON over HTTPS • Authorization: Bearer <key>. Enter at least one numeric field path: remaining quota 0–100% or daily cost in USD. A chat/completions URL is not a usage endpoint.", "GET JSON en HTTPS • Authorization: Bearer <clé>. Renseigne au moins un chemin numérique : quota restant 0–100 % ou coût du jour en USD. Une URL de chat/completions n'est pas un endpoint de consommation.")
+        alert.addButton(withTitle: I18n.t("Save & test", "Enregistrer et tester"))
+        alert.addButton(withTitle: I18n.t("Cancel", "Annuler"))
+        let height: CGFloat = openRouter ? 174 : 278
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 430, height: height))
+        var y = height
+        func field(_ label: String, value: String, placeholder: String = "", secure: Bool = false) -> NSTextField {
+            y -= 21
+            let text = NSTextField(labelWithString: label)
+            text.font = NSFont.systemFont(ofSize: 11)
+            text.frame = NSRect(x: 0, y: y, width: 430, height: 18)
+            view.addSubview(text)
+            y -= 29
+            let input: NSTextField = secure ? NSSecureTextField() : NSTextField()
+            input.frame = NSRect(x: 0, y: y, width: 430, height: 24)
+            input.stringValue = value; input.placeholderString = placeholder
+            view.addSubview(input)
+            y -= 2
+            return input
+        }
+        let name = field(I18n.t("Name", "Nom"), value: existing?.name ?? (openRouter ? "OpenRouter" : ""))
+        let url = field(I18n.t("Usage API URL", "URL de l'API de consommation"), value: existing?.url ?? (openRouter ? "https://openrouter.ai/api/v1/key" : ""), placeholder: "https://…/usage")
+        if openRouter { url.isEditable = false; url.isSelectable = true }
+        let key = field(I18n.t("API key (stored in Keychain)", "Clé API (conservée dans le Trousseau)"), value: "", placeholder: existing == nil ? "sk-…" : I18n.t("Leave empty to keep the current key", "Laisser vide pour conserver la clé"), secure: true)
+        var remaining: NSTextField?
+        var cost: NSTextField?
+        if !openRouter {
+            remaining = field(I18n.t("JSON path: remaining % (optional)", "Chemin JSON : % restant (facultatif)"), value: existing?.remainingPath ?? "", placeholder: "data.remaining_percent")
+            cost = field(I18n.t("JSON path: daily cost USD (optional)", "Chemin JSON : coût du jour USD (facultatif)"), value: existing?.dailyCostPath ?? "", placeholder: "data.usage_daily")
+        }
+        alert.accessoryView = view
+        alert.window.initialFirstResponder = existing == nil && !openRouter ? name : key
+        NSApp.activate(ignoringOtherApps: true)
+        // Garder les champs remplis en cas d'erreur de validation ou de Trousseau.
+        while alert.runModal() == .alertFirstButtonReturn {
+            func clean(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+            var p = existing ?? AddedProvider(name: "", url: "", openRouter: openRouter)
+            p.name = clean(name.stringValue); p.url = clean(url.stringValue)
+            p.remainingPath = clean(remaining?.stringValue ?? "")
+            p.dailyCostPath = clean(cost?.stringValue ?? "")
+            let secret = clean(key.stringValue)
+            let others = AddedProviders.configs.filter { $0.id != p.id }
+            if p.name.isEmpty || p.name.count > 32 || p.name.contains(where: { $0.isNewline }) {
+                providerMessage(I18n.t("Enter a name of 1–32 characters.", "Renseigne un nom de 1 à 32 caractères.")); continue
+            }
+            if (["Claude", "Codex", "Ollama"] + others.map { $0.name }).contains(where: { $0.lowercased() == p.name.lowercased() }) {
+                providerMessage(I18n.t("This name is already in use.", "Ce nom est déjà utilisé.")); continue
+            }
+            guard AddedProviders.validURL(p.url, openRouter: openRouter) != nil else {
+                providerMessage(I18n.t("Use an HTTPS URL without credentials, query or fragment.", "Utilise une URL HTTPS sans identifiants, paramètres ni fragment.")); continue
+            }
+            if !openRouter && p.remainingPath.isEmpty && p.dailyCostPath.isEmpty {
+                providerMessage(I18n.t("Enter at least one JSON field path.", "Renseigne au moins un chemin de champ JSON.")); continue
+            }
+            if secret.isEmpty && (existing == nil || existing?.url != p.url) {
+                providerMessage(I18n.t("Enter the API key. Re-enter it when changing the destination URL.", "Renseigne la clé API. Saisis-la à nouveau si tu changes l'URL de destination.")); continue
+            }
+            if secret.contains(where: { $0.isWhitespace || $0.isNewline }) {
+                providerMessage(I18n.t("The key must not contain spaces or line breaks.", "La clé ne doit pas contenir d'espaces ni de retours à la ligne.")); continue
+            }
+            if !secret.isEmpty {
+                let status = AddedProviders.storeKey(secret, id: p.id)
+                guard status == errSecSuccess else {
+                    providerMessage(I18n.t("Keychain could not save the key (\(status)).", "Le Trousseau n'a pas pu enregistrer la clé (\(status)).")); continue
+                }
+            }
+            AddedProviders.save(others + [p])
+            if preferencesWindow?.isVisible == true { buildPreferences() }
+            AddedProviders.readings.removeAll { $0.id == p.id }
+            AddedProviders.readings.append(ProviderReading(id: p.id, name: p.name, error: I18n.t("Checking connection…", "Test de connexion…")))
+            refreshAddedProviders(force: true)
+            let usage = lastUsage ?? Usage()
+            rebuildMenu(usage: usage)
+            WidgetFeed.publish(usage, updated: lastUpdate ?? Date())
+            break
+        }
+    }
+
     /// Change le fournisseur affiché dans la barre de menus (effet immédiat).
     @objc func changeBarProvider(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let p = BarProvider(rawValue: raw),
               p != BarPref.current else { return }
+        UserDefaults.standard.removeObject(forKey: "customBarProvider")
         BarPref.set(p)
+        if preferencesWindow?.isVisible == true { buildPreferences() }
         if let u = lastUsage { updateTitle(u); rebuildMenu(usage: u) }
     }
 
@@ -2445,12 +3049,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let u = lastUsage { rebuildMenu(usage: u) }
     }
 
-    /// Active/désactive le compteur des modèles locaux. Les ports sont ouverts ou
-    /// refermés immédiatement, sans redémarrage.
-    @objc func toggleLocalCounter() {
-        LocalCounterPref.toggle()
-        if let u = lastUsage { rebuildMenu(usage: u) }
-    }
 
     /// Change la langue de l'interface et reconstruit l'affichage immédiatement.
     @objc func changeLanguage(_ sender: NSMenuItem) {
@@ -2483,8 +3081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
-    /// Section Codex : en-tête (plan + coût), puis les fenêtres qui existent (depuis 2026
-    /// une seule hebdo) + l'âge du relevé (donnée passive : elle bouge quand Codex tourne).
+    /// Section Codex : plan, coût, fenêtres disponibles et âge du relevé local.
     private func codexItems(_ u: Usage) -> [NSMenuItem] {
         let name = u.codexPlan.map { "Codex · \($0)" } ?? "Codex"
         let rows = codexBreakdown(u)
@@ -2516,9 +3113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Section Ollama Cloud : affichée UNIQUEMENT si une clé API est configurée
     /// (sinon on n'a rien à montrer). Pas de ligne de reset : l'API n'en publie pas.
     private func ollamaItems(_ u: Usage) -> [NSMenuItem] {
-        guard u.ollamaSession != nil || u.ollamaWeekly != nil else { return [] }
+        guard u.ollamaSession != nil || u.ollamaWeekly != nil || u.ollamaError != nil || u.ollamaSessionInactive == true else { return [] }
         let name = u.ollamaPlan.map { "Ollama · \($0)" } ?? "Ollama · cloud"
-        var items: [NSMenuItem] = [providerHeader(name, cost: nil)]
+        var items: [NSMenuItem] = [providerHeader(name, cost: nil,
+            toolTip: I18n.t("Cloud quotas remaining, not local model usage", "Quotas cloud restants, pas la consommation des modèles locaux"))]
+        func note(_ text: String) -> NSMenuItem {
+            displayItem(NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]), indent: 16)
+        }
+        if let error = u.ollamaError { items.append(note(error)); return items }
+        if u.ollamaSessionInactive == true { items.append(note(I18n.t("Session inactive — no requests in this window", "Session inactive — aucune requête dans cette fenêtre"))) }
         if u.ollamaSession != nil {
             items += compactQuota(symbol: "bolt", label: I18n.t("session", "session"),
                                   limit: u.ollamaSession)
@@ -2526,6 +3129,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if u.ollamaWeekly != nil {
             items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"),
                                   limit: u.ollamaWeekly)
+        }
+        if let date = u.ollamaAsOf {
+            items.append(note(I18n.t("Remaining quotas · reading ", "Quotas restants · relevé ") + UI.agoText(date)))
+        }
+        if (u.ollamaSession != nil && u.ollamaSession?.resetsAt == nil) || (u.ollamaWeekly != nil && u.ollamaWeekly?.resetsAt == nil) {
+            items.append(note(I18n.t("Reset time not provided by Ollama", "Heure de reset non fournie par Ollama")))
         }
         // Le coût Ollama porte sur 4 SEMAINES : on l'étiquette explicitement pour qu'il
         // ne se confonde pas avec les coûts du JOUR affichés au-dessus, et on ne
@@ -2644,23 +3253,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // Comment obtenir des chiffres : le compteur ne voit que ce qui passe par lui.
-        if !LocalCounterPref.enabled {
-            items.append(note(I18n.t("Counter off — switch on “Count local models” below.",
-                                     "Compteur éteint — active « Compter les modèles locaux » plus bas.")))
-        } else {
-            let listening = LocalCounter.shared.running
-            for rt in (detected.isEmpty ? LocalRuntime.allCases : detected) {
-                if !listening.contains(rt) {
-                    items.append(note(I18n.t("\(rt.displayName): port \(rt.counterPort) taken — not counting",
-                                             "\(rt.displayName) : port \(rt.counterPort) occupé — pas de comptage"),
-                                      indent: 28))
-                } else if (counted[rt.rawValue] ?? [:]).isEmpty {
-                    items.append(note("\(rt.displayName) → \(rt.clientHint)", indent: 28))
-                }
+        // Le compteur démarre automatiquement ; seul le trafic qui le traverse est visible.
+        let listening = LocalCounter.shared.running
+        for rt in (detected.isEmpty ? LocalRuntime.allCases : detected) {
+            if !listening.contains(rt) {
+                items.append(note(I18n.t("\(rt.displayName): port \(rt.counterPort) unavailable — not counting",
+                                         "\(rt.displayName) : port \(rt.counterPort) indisponible — pas de comptage"),
+                                  indent: 28))
+            } else if (counted[rt.rawValue] ?? [:]).isEmpty {
+                items.append(note("\(rt.displayName) → \(rt.clientHint)", indent: 28))
             }
         }
         return items
+    }
+    /// Les résumés utilisent les mêmes quotas que le mode normal : aucune estimation.
+    private func summarizedSections(_ u: Usage) -> [NSMenuItem] {
+        var result: [NSMenuItem] = []
+        func add(_ id: String, _ name: String, cost: Double?, windows: [(String, Limit?)],
+                 status: String? = nil, details: [NSMenuItem]) {
+            guard ContentPref.visible(id), !details.isEmpty else { return }
+            let parts = windows.compactMap { label, limit -> String? in
+                limit.map { label + " " + String(format: "%.0f%%", $0.remaining) }
+            }
+            var title = name + (parts.isEmpty ? "" : "   " + parts.joined(separator: " · "))
+            if let status = status { title += "   " + status }
+            if let cost = cost { title += "   " + UI.humanCost(cost, decimals: 2) }
+            if DetailedMenuStyle.current == .folded {
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                let submenu = NSMenu()
+                for detail in details { submenu.addItem(detail) }
+                item.submenu = submenu
+                result.append(item)
+            } else {
+                let tip = details.compactMap { item in
+                    (item.view?.subviews.first as? NSTextField)?.stringValue
+                }.joined(separator: "\n")
+                result.append(displayItem(NSAttributedString(string: title, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.labelColor]), indent: 16, toolTip: tip))
+            }
+        }
+        add("claude", "Claude", cost: u.todayCost, windows: [("5h", u.fiveHour), (I18n.t("week", "hebdo"), u.sevenDay)], details: claudeItems(u))
+        add("codex", "Codex", cost: u.codexTodayCost, windows: [("5h", u.codexFiveHour), (I18n.t("week", "hebdo"), u.codexSevenDay)], details: codexItems(u))
+        add("ollama", "Ollama", cost: nil, windows: [(I18n.t("session", "session"), u.ollamaSession), (I18n.t("week", "hebdo"), u.ollamaWeekly)],
+            status: u.ollamaError ?? (u.ollamaSessionInactive == true ? I18n.t("session inactive", "session inactive") : nil), details: ollamaItems(u))
+        for r in AddedProviders.readings {
+            var details = [providerHeader(r.name, cost: r.dailyCost)]
+            if let error = r.error { details.append(displayItem(NSAttributedString(string: error))) }
+            var windows: [(String, Limit?)] = []
+            if let requests = r.dailyRequestsRemaining, let limit = r.dailyRequestLimit, limit > 0 {
+                let percent = max(0, min(100, requests / limit * 100))
+                let l = Limit(utilization: 100 - percent, resetsAt: nil)
+                windows.append(("daily", l))
+                details += compactQuota(symbol: "number", label: "daily", limit: l)
+            }
+            add(r.id, r.name, cost: r.dailyCost, windows: windows, status: r.error, details: details)
+        }
+        let local = localItems(u)
+        let localStatus = u.localTokens.map { UI.humanTokens($0) + " tokens" } ?? I18n.t("no tokens counted", "aucun token compté")
+        add("local", I18n.t("Local models", "Modèles locaux"), cost: nil, windows: [], status: localStatus, details: local)
+        return result
     }
 
     func rebuildMenu(usage: Usage? = nil, loadingMessage: String? = nil,
@@ -2691,19 +3342,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ])))
             }
         } else if let u = usage {
+            if DetailedMenuStyle.current == .ultra || DetailedMenuStyle.current == .folded {
+                for item in summarizedSections(u) { menu.addItem(item) }
+            } else {
             // Deux sections compactes : Claude puis Codex.
-            for item in claudeItems(u) { menu.addItem(item) }
-            menu.addItem(.separator())
-            for item in codexItems(u) { menu.addItem(item) }
+            if ContentPref.visible("claude") { for item in claudeItems(u) { menu.addItem(item) } }
+            if ContentPref.visible("codex") {
+                menu.addItem(.separator())
+                for item in codexItems(u) { menu.addItem(item) }
+            }
             let ollama = ollamaItems(u)
-            if !ollama.isEmpty {
+            if ContentPref.visible("ollama") && !ollama.isEmpty {
                 menu.addItem(.separator())
                 for item in ollama { menu.addItem(item) }
             }
+            for r in AddedProviders.readings where ContentPref.visible(r.id) {
+                menu.addItem(.separator())
+                menu.addItem(providerHeader(r.name, cost: r.dailyCost,
+                    toolTip: I18n.t("Daily API spend; separate from the Claude/Codex total", "Dépense API du jour ; séparée du total Claude/Codex")))
+                if let error = r.error {
+                    menu.addItem(displayItem(NSAttributedString(string: error, attributes: [.foregroundColor: NSColor.systemOrange]), indent: 16))
+                } else if let requests = r.dailyRequestsRemaining, let limit = r.dailyRequestLimit, limit > 0 {
+                    let percent = max(0, min(100, requests / limit * 100))
+                    for item in compactQuota(symbol: "number", label: "daily",
+                                             limit: Limit(utilization: 100 - percent, resetsAt: nil),
+                                             toolTip: "\(Int(requests))/\(Int(limit)) \(I18n.t("requests", "requêtes"))") { menu.addItem(item) }
+                }
+            }
             let local = localItems(u)
-            if !local.isEmpty {
+            if ContentPref.visible("local") && !local.isEmpty {
                 menu.addItem(.separator())
                 for item in local { menu.addItem(item) }
+            }
             }
             // Pied : coût total du jour (Claude + Codex) + projection.
             if let total = u.totalTodayCost {
@@ -2720,6 +3390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         for item in footerItems() { menu.addItem(item) }
+        updateDetailedMenuPreview()
     }
 
     @objc func quit() { NSApplication.shared.terminate(nil) }
@@ -2754,19 +3425,16 @@ func printUsage(_ u: Usage) {
     let codexBar = (u.codexFiveHour.map { "5h \(pct($0))  ·  " } ?? "") + "7j \(pct(u.codexSevenDay))"
     let ollamaBar = (u.ollamaSession.map { _ in "ses \(pct(u.ollamaSession))  ·  " } ?? "")
         + "7j \(pct(u.ollamaWeekly))"
-    let localBar = (u.localTokens.map { UI.humanTokens($0) } ?? "—")
-        + (u.localRequests.map { "  ·  \($0) req" } ?? "")
     let (barBody, barCost): (String, Double?) = {
         switch BarPref.current {
         case .claude: return (claudeBar, u.todayCost)
         case .codex:  return (codexBar, u.codexTodayCost)
         case .ollama: return (ollamaBar, nil)
-        case .local:  return (localBar, nil)
         case .total:  return ("", u.totalTodayCost)
         }
     }()
     // Le « $— » n'a de sens que si la barre ne montre RIEN d'autre (mode cumul sans
-    // ccusage) : Ollama et les modèles locaux n'ont pas de coût du jour à afficher.
+    // ccusage) : Ollama n'a pas de coût du jour à afficher.
     let barTail = barCost.map { (barBody.isEmpty ? "" : "  ·  ") + UI.humanCost($0) }
         ?? (barBody.isEmpty ? "$—" : "")
     print("Titre barre  : [\(BarPref.current.menuTitle)] \(barBody)" + barTail)
@@ -2789,7 +3457,7 @@ func printUsage(_ u: Usage) {
         let up = (u.localDetected ?? []).compactMap { LocalRuntime(rawValue: $0)?.displayName }
         print("— Modèles locaux —")
         print("Détectés    : " + (up.isEmpty ? "aucun" : up.joined(separator: ", "))
-              + (LocalCounterPref.enabled ? "  (compteur actif)" : "  (compteur éteint)"))
+              + "  (comptage automatique)")
         for rt in LocalRuntime.allCases {
             guard let models = u.localByRuntime?[rt.rawValue], !models.isEmpty else { continue }
             let reqs = models.values.reduce(0) { $0 + $1.requests }
@@ -2802,9 +3470,7 @@ func printUsage(_ u: Usage) {
         }
         if u.localByRuntime == nil {
             print("Compté      : rien aujourd'hui"
-                  + (LocalCounterPref.enabled
-                     ? " — pointe le client sur " + LocalRuntime.allCases.map { $0.clientHint }.joined(separator: " / ")
-                     : " — active le compteur dans le menu"))
+                  + " — pointe le client sur " + LocalRuntime.allCases.map { $0.clientHint }.joined(separator: " / "))
         }
     }
     if let cc = u.codexTodayCost, let ct = u.codexTodayTokens {
@@ -2907,7 +3573,6 @@ if CommandLine.arguments.contains("--mock") {
     u.codexSevenDay = cl.sevenDay
     u.codexPlan = cl.plan
     u.codexAsOf = cl.asOf
-    Fetcher.readLocal(into: &u)
     print("[MOCK — utilisation factice 30%/80%, données ccusage + quotas Codex réels]")
     printUsage(u)
     // Vérif du round-trip Codable EN MÉMOIRE (ne pollue pas le vrai cache disque).
@@ -2946,12 +3611,20 @@ if CommandLine.arguments.contains("--refresh") {
     exit(1)
 }
 
+// Import ciblé sans lancer de fenêtre ni afficher la clé.
+if CommandLine.arguments.contains("--import-openrouter") {
+    if let error = AddedProviders.importOpenRouter() { print(error); exit(1) }
+    print("OpenRouter imported into Keychain.")
+    exit(0)
+}
+
 // `--once` : vrai appel à l'API, imprime le résultat et quitte.
 if CommandLine.arguments.contains("--once") {
     // fetch livre son résultat sur la main queue → on fait tourner la run loop.
     Fetcher.fetch { result in
         switch result {
         case .ok(let u): printUsage(u)
+        case .partial(let u, let m): printUsage(u); print("Claude : \(m)")
         case .authError: print("AUTH ERROR : session expirée et refresh impossible — reconnecte-toi à Claude.")
         case .error(let m): print("ERREUR : \(m)")
         }

@@ -18,6 +18,8 @@ import SwiftUI
 /// Miroir de ce que l'app de barre de menus sait déjà. Tout est optionnel :
 /// un chiffre absent s'affiche « — » plutôt que de faire échouer le rendu.
 struct Snapshot: Codable {
+    var hiddenProviders: [String]?
+    var addedProviders: [AddedProviderSnapshot]?
     var updated: Double = 0
     var lang: String?                 // l'extension ne peut pas lire les prefs de l'app
     var claudePlan: String?
@@ -47,18 +49,25 @@ struct Snapshot: Codable {
     /// Coût Ollama sur 4 SEMAINES — jamais mêlé aux coûts du jour.
     var ollamaCost4w: Double?
     var ollamaPlan: String?
+    var ollamaAsOf: Double?
+    var ollamaError: String?
+    var ollamaSessionInactive: Bool?
     /// Tokens du jour par fournisseur (Ollama absent : son API compte des requêtes,
     /// pas des tokens).
     var claudeTokens: Double?
     var codexTokens: Double?
-    /// Modèles LOCAUX (Ollama local, LM Studio) : tokens et requêtes du jour, et le
-    /// nom des runtimes qui ont servi. Jamais de coût — ils tournent sur la machine —
-    /// et volontairement hors de `TokenShareBar`, qui compare des tokens FACTURÉS.
-    var localTokens: Double?
-    var localRequests: Int?
-    var localNames: [String]?
-
     var isFrench: Bool { lang == "fr" }
+}
+
+struct AddedProviderSnapshot: Codable, Identifiable {
+    var id: String
+    var name: String
+    var remaining: Double?
+    var dailyCost: Double?
+    var credit: Double?
+    var dailyRequestsRemaining: Double?
+    var dailyRequestLimit: Double?
+    var error: String?
 }
 
 struct SplitRow: Codable {
@@ -146,6 +155,7 @@ struct QuotaLine: View {
                 .lineLimit(1)
         }
         .frame(height: 15)
+        .help(t(snap, "Quota remaining", "Quota restant"))
     }
 }
 
@@ -163,6 +173,12 @@ struct ProviderBlock: View {
                 Text(name).font(.system(size: 12, weight: .semibold))
                 if let p = plan {
                     Text(p).font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+                if name == "Codex", let epoch = snap.codexAsOf {
+                    let minutes = max(0, Int((Date().timeIntervalSince1970 - epoch) / 60))
+                    Text(minutes < 60 ? "· \(minutes) min" : "· \(minutes / 60) h")
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                        .help(t(snap, "Age of the Codex reading", "Âge du relevé Codex"))
                 }
                 Spacer(minLength: 4)
                 // Rien plutôt qu'un « — » : Ollama ne publie pas de coût du jour, et
@@ -232,31 +248,96 @@ struct TokenShareBar: View {
     }
 }
 
-/// Modèles locaux, sur une ligne discrète. Ni jauge ni dollars : ils n'ont pas de
-/// quota et ne facturent rien — ce qui se mesure, ce sont des tokens et des requêtes.
-/// Absente tant que rien n'a été compté, donc sans effet sur la mise en page.
-struct LocalLine: View {
+// MARK: - Design « ultra-lignes » (taille small)
+
+/// Un fournisseur au format compact : nom, mini-jauges de ses fenêtres, coût du jour.
+/// Sans plan ni heure de reset : à trois fournisseurs c'est ce qui tient dans la
+/// small, et ce sont les pourcentages colorés qui décident d'un coup d'œil. Le plan
+/// reste dans le menu de l'app, les resets partent en infobulle.
+struct MiniProvider: Identifiable {
+    let name: String
+    let plan: String?
+    let cost: Double?
+    let windows: [(String, Double?, Double?)]
+    var id: String { name }
+}
+
+/// Mini-jauge : barre de 10 pt + pourcentage coloré, sans libellé. Le couple
+/// (libellé, reset) part en infobulle — la ligne ne tient qu'avec ce rétrécissement.
+struct MiniWindowBar: View {
     let snap: Snapshot
+    let label: String
+    let remaining: Double?
+    let reset: Double?
+
+    var help: String {
+        guard let r = remaining else { return t(snap, label, label) }
+        let pct = String(format: "%.0f", r)
+        var text = t(snap, "\(label): \(pct)% remaining", "\(label) : \(pct) % restant")
+        if let e = reset, let rel = resetText(e, snap) {
+            text += " · \(rel)"
+        }
+        return text
+    }
 
     var body: some View {
-        if let tokens = snap.localTokens, tokens > 0 {
-            HStack(spacing: 5) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 9)).foregroundStyle(.tertiary)
-                Text(snap.localNames?.joined(separator: " · ") ?? t(snap, "Local", "Local"))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary).lineLimit(1)
-                Spacer(minLength: 2)
-                Text(humanTokens(tokens))
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                if let r = snap.localRequests {
-                    Text("· \(r) req")
-                        .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
+        let c = remaining.map { color(forRemaining: $0) } ?? .secondary
+        HStack(spacing: 2) {
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(c)
+                    .frame(width: 10 * CGFloat(max(0, min(100, remaining ?? 0)) / 100),
+                           height: 3.5)
+            }
+            .frame(width: 10, height: 3.5)
+            if let r = remaining {
+                Text(String(format: "%.0f", r))
+                    .font(.system(size: 9, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(c)
+                    .frame(minWidth: 14, alignment: .trailing)
             }
         }
+        .help(help)
+    }
+}
+
+/// Une ligne de fournisseur en version small. Le coût à droite suit le même choix
+/// que le gros widget : pas de « — » fabriqué pour Ollama, la case reste vide.
+struct MiniProviderRow: View {
+    let snap: Snapshot
+    let p: MiniProvider
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(p.name)
+                .font(.system(size: 10, weight: .semibold))
+                .lineLimit(1)
+                // Colonne commune aux trois fournisseurs : les jauges s'alignent.
+                .minimumScaleFactor(0.8)
+                .frame(width: p.windows.count <= 1 ? 58 : 34, alignment: .leading)
+            ForEach(p.windows.indices, id: \.self) { i in
+                MiniWindowBar(snap: snap, label: p.windows[i].0,
+                              remaining: p.windows[i].1, reset: p.windows[i].2)
+            }
+            if p.windows.isEmpty && p.cost == nil {
+                Text(p.plan ?? "—").font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if let c = p.cost {
+                Text(humanCost(c, decimals: c < 10 ? 2 : 0))
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .layoutPriority(1)
+            }
+        }
+        .frame(height: 14)
+        .help(
+            p.plan.map { plan in
+                t(snap, "\(p.name) plan \(plan)", "\(p.name) plan \(plan)")
+            } ?? t(snap, p.name, p.name)
+        )
     }
 }
 
@@ -297,8 +378,56 @@ struct WidgetBody: View {
               (t(s, "week", "hebdo"), s.ollamaWeek, s.ollamaWeekReset)])
     }
 
+    /// La taille small en « ultra-lignes » : une ligne par fournisseur sans en-tête,
+    /// puis le coût du jour en pied. Un fournisseur sans quota NI coût n'a rien à
+    /// montrer sur une ligne de ce gabarit : il est écarté plutôt que grisé.
+    private func smallBody(_ s: Snapshot) -> some View {
+        let providers = miniProviders(s)
+        return VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(providers.prefix(5))) { MiniProviderRow(snap: s, p: $0) }
+            if providers.count > 5 {
+                Text(t(s, "+\(providers.count - 5) in menu", "+\(providers.count - 5) dans le menu")).font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+            if providers.isEmpty {
+                Text(t(s, "no quota data", "pas de quota"))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+            footer(s)
+        }
+    }
+
+    private func miniProviders(_ s: Snapshot) -> [MiniProvider] {
+        var out = [
+            MiniProvider(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
+                         windows: claudeRows(s)),
+            MiniProvider(name: "Codex", plan: s.codexPlan, cost: s.codexCost,
+                         windows: codexRows(s)),
+        ]
+        let ollamaStatus = s.ollamaError ?? (s.ollamaSessionInactive == true ? t(s, "Inactive session", "Session inactive") : s.ollamaPlan)
+        if !ollamaRows(s).isEmpty || ollamaStatus != nil {
+            out.append(MiniProvider(name: "Ollama", plan: ollamaStatus, cost: nil,
+                                    windows: s.ollamaError == nil ? ollamaRows(s) : []))
+        }
+        out = out.filter {
+            !(s.hiddenProviders ?? []).contains($0.name.lowercased()) && (!$0.windows.isEmpty || $0.cost != nil || ($0.name == "Ollama" && $0.plan != nil))
+        }
+        for p in s.addedProviders ?? [] {
+            var windows: [(String, Double?, Double?)] = []
+            if let remaining = p.dailyRequestsRemaining, let limit = p.dailyRequestLimit, limit > 0 {
+                windows.append(("daily", max(0, min(100, remaining / limit * 100)), nil))
+            }
+            out.append(MiniProvider(name: p.name, plan: p.error, cost: p.dailyCost, windows: windows))
+        }
+        return out
+    }
+
     @ViewBuilder
     private func content(_ s: Snapshot) -> some View {
+        if s.addedProviders?.isEmpty == false || s.hiddenProviders?.isEmpty == false || s.ollamaError != nil || s.ollamaSessionInactive == true {
+            smallBody(s)
+        } else {
         switch family {
         case .systemLarge:
             VStack(alignment: .leading, spacing: 9) {
@@ -316,17 +445,13 @@ struct WidgetBody: View {
                 // et creusait un grand vide sous les quotas. Placé après le pied, le
                 // contenu reste groupé en haut et le surplus retombe en bas.
                 TokenShareBar(snap: s).padding(.top, 2)
-                LocalLine(snap: s)
                 footer(s)
                 Spacer(minLength: 0)
             }
         case .systemSmall:
-            VStack(alignment: .leading, spacing: 5) {
-                ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
-                              rows: claudeRows(s), snap: s)
-                Spacer(minLength: 0)
-                footer(s)
-            }
+            // Design « ultra-lignes » : une ligne par fournisseur (les resets et
+            // le plan partent en infobulle, les heures de reset restent au menu).
+            smallBody(s)
         default:   // systemMedium : les deux gros fournisseurs, empilés.
             VStack(alignment: .leading, spacing: 7) {
                 ProviderBlock(name: "Claude", plan: s.claudePlan, cost: s.claudeCost,
@@ -337,6 +462,7 @@ struct WidgetBody: View {
                 Spacer(minLength: 0)
                 footer(s)
             }
+        }
         }
     }
 

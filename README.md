@@ -1,14 +1,11 @@
-# Agent Usage — Claude, Codex, Ollama + local models in your menu bar (macOS)
+# Agent Usage — Claude, Codex and Ollama in your menu bar (macOS)
 
 A tiny native macOS menu-bar widget that shows **what you have left** across
-**Claude**, **Codex** and **Ollama Cloud** — and **what you've used** on the models
-running on your own Mac (**Ollama** and **LM Studio**), at a glance:
+**Claude**, **Codex** and **Ollama Cloud**, at a glance:
 
 - ⌛ your **5-hour** rolling window and 🗓 your **weekly** quota — for each
   (Ollama reports a **session** window instead of a 5-hour one);
 - 💲 today's **combined cost** (via [`ccusage`](https://github.com/ryoppippi/ccusage)) with an **end-of-day projection**;
-- 🖥 today's **tokens and requests per local model** — no quota and no bill there, so
-  that's what there is to count;
 - 🔔 an optional **notification** the moment a quota window resets.
 
 The menu-bar icons stay monochrome and only turn **orange/red** when a quota gets low.
@@ -32,11 +29,6 @@ Click them for the full breakdown.
 │ Ollama · pro                       │
 │  ⚡ session ▬▬▬▬▬▬▬▬▬▬  100%       │
 │  🗓 week   ▬▬▬▬▬▬▬▭▭▭   73%         │
-│ Local models              1,4 M tok│
-│  Ollama            18 req · 920 k  │
-│    llama3.1:8b     12 req · 780 k  │
-│    qwen2.5:7b       6 req · 140 k  │
-│  LM Studio          9 req · 480 k  │
 │ Today $437 · ~$768 projected       │
 │ Menu bar ▸ · Language ▸ · Refresh  │
 └────────────────────────────────────┘
@@ -49,16 +41,14 @@ right-click the desktop → **Edit Widgets**, or click the clock → scroll down
 
 | Widget | Shows | Sizes |
 |---|---|---|
-| **Agent Usage** | Claude + Codex quotas, today's cost, projection — **plus Ollama Cloud and a local-models line on the large size** | small, medium, large |
+| **Agent Usage** | Claude + Codex quotas, today's cost, projection — **plus Ollama Cloud on the large size** | small, medium, large |
 | **Agent Usage — Cost detail** | today's cost **split by token type** (cache read / cache write / output / input), with a proportion bar per row | small, medium, large |
 
 Both **large** sizes also carry a **token-share bar**: today's tokens split by provider, as a
 stacked bar with a legend (`Claude 97% · Codex 3%`). It is on the large sizes only — a widget
-does not scroll, and the smaller ones are already full. **Ollama Cloud and local models are
-deliberately absent from it**: Ollama's API reports `request_count`, not tokens, and local
-tokens are free — the bar compares *billed* tokens, so folding either in would make the
-percentages wrong. Local usage gets its own line underneath instead, and only once there is
-something to show.
+does not scroll, and the smaller ones are already full. **Ollama Cloud is deliberately absent
+from it** because its API reports `request_count`, not tokens; folding requests into a token
+comparison would make the percentages wrong.
 
 The split is the same one the menu-bar app computes — no prices are hardcoded, a known total is
 divided by price *ratios*, so the rows always add up to the cost shown.
@@ -89,7 +79,6 @@ eyes without clicking:
 | **Claude** (default) | `⌛70% 🗓20% $436` — Claude's 5h + weekly, and Claude's cost |
 | **Codex** | `🗓78% $0.75` — Codex's weekly, and Codex's cost |
 | **Ollama** | `⚡100% 🗓73%` — Ollama's session + weekly, and **no cost**: its API only reports a 4-week figure, which would clash with the daily numbers everywhere else |
-| **Local models** | `🖥 1,4 M  18 req` — today's tokens and requests on your own machine, and **no cost**: they don't bill anything |
 | **Total cost** | `$437` — the combined spend, nothing else |
 
 The cost always follows the same choice, so the whole bar talks about one thing.
@@ -145,15 +134,22 @@ the background every ~10 min and, on menu open, only re-fetches when the data is
 5 minutes — otherwise it shows the cached value. A transient `429` is treated as harmless.
 
 ### Codex — read from local logs (no API)
-Codex has no usage API, so the quota is read from your local Codex logs. Since mid-2026 OpenAI
-moved Codex to a **single weekly window** (it used to be a 5-hour + weekly pair) — the widget
-classifies each window by its **duration**, so it always shows whatever windows currently exist.
+The widget reads quota snapshots from local Codex logs. It classifies windows by
+`window_minutes`, rather than assuming that `primary` always means 5 hours: the
+available windows depend on the account and the budget Codex reports.
 
-The reading comes from `~/.codex/sessions/**/rollout-*.jsonl` (the `rate_limits` events), and,
-on Codex versions that still log them, the `X-Codex-*` response headers in
-`~/.codex/logs_2.sqlite`. The freshest reading wins. Because this data is **passive** (it only
-updates when Codex makes a call), the widget shows the **age of the last reading** ("last
-reading X ago") so you know the figures are from your last Codex call, not real time.
+The reading comes from `~/.codex/sessions/**/rollout-*.jsonl` (`rate_limits` events
+for the account's `codex` budget), and, on versions that still log them, the
+`X-Codex-*` response headers in `~/.codex/logs_2.sqlite`. The freshest reading wins.
+The widget and menu show **remaining** quota (`100 − used_percent`), whereas Codex
+may show consumption.
+
+These logs only change when Codex makes a call. The menu-bar app reads them every
+minute and when opening the menu, independently of Claude's API and retry backoff.
+It shows the age of the reading in both the menu and the desktop widget. Costs
+and the other providers also refresh when Claude's API is unavailable; cached
+Claude quotas keep their original refresh timestamp. macOS still controls when
+a WidgetKit redraw request is displayed.
 
 ### Ollama Cloud — opt-in, needs an API key
 Ollama Cloud publishes its quota at `GET https://ollama.com/api/usage`, and nothing else works:
@@ -176,30 +172,31 @@ Two windows are shown, **session** and **weekly** — the API reports each as a 
 (`usage: 1` means the quota is spent, which is what a `429 … reached your session usage limit`
 looks like from the CLI). The account **plan** comes from `POST /api/me`.
 
-**Reset times take some work**, because Ollama publishes none — not in the body, not in the
-response headers, not even on the `429`:
+**Only server-reported quotas are displayed.** A consumed fraction of 0.706 means
+70.6% used and 29.4% remaining; every gauge in this app shows **remaining** quota.
+An empty session (`usage: 0`, `models: []`) is labelled inactive rather than shown
+as a full gauge. HTTP/format failures clear the gauges and display an unavailable
+status instead of silently keeping old values. The menu shows the reading's age.
 
-- **Weekly** is derived from `activity.period.starting_at`, which is a week boundary (a Monday
-  00:00 UTC). The widget uses that value as the anchor and steps forward in 7-day jumps, so it
-  reads the anchor *from Ollama* rather than hardcoding a weekday.
-- **Session** has no published duration at all, so the widget **observes** it: it records the
-  consumption at each refresh, treats a sharp drop as a reset, and once it has seen two resets it
-  knows the period and can show the next one. Until then the row simply has no time — nothing is
-  invented.
+**Reset dates are not inferred.** The four-week activity period is not a weekly
+quota reset, and decreases in usage do not prove a fixed session period. Only an
+explicit `resets_at` field from the quota window can produce a countdown; otherwise
+the app says that Ollama did not provide the reset time. Old inferred cache dates
+are discarded. New credit-based Ollama plans may not correspond to this legacy
+session/weekly endpoint; a monthly balance must not be fabricated from it.
 
 Ollama's `activity.cost` covers the **last 4 weeks**, not today, so it is labelled as such and is
 never added to the daily total or the projection.
 
-### Local models (Ollama + LM Studio) — opt-in, counted as they run
+### Local models (Ollama + LM Studio) — automatic counting
 Models running on your own Mac have **no quota and no bill**, so there is no percentage
 and no dollar figure to show. What there *is* to count is **tokens and requests, per
 model** — and that is what this section does.
 
 **The section appears on its own** as soon as either runtime answers on its default port
-(Ollama on `11434`, LM Studio on `1234`), listing what is loaded in memory. Counting
-tokens is a separate, explicit step.
+(Ollama on `11434`, LM Studio on `1234`), listing what is loaded in memory. The token counter starts automatically with the menu-bar app.
 
-**Why an opt-in counter and not a log file.** Neither runtime keeps a usage total you
+**Why a response counter and not a log file.** Neither runtime keeps a usage total you
 could read after the fact:
 
 - Ollama's `~/.ollama/logs/server.log` is a Gin **access log** — method, path, status,
@@ -214,9 +211,9 @@ runtimes report their own counts (`prompt_eval_count` / `eval_count` for Ollama,
 `usage.prompt_tokens` / `completion_tokens` on the OpenAI-compatible routes both
 expose). So the widget reads them there, as they go past.
 
-**Turn on `Count local models`** in the menu. The app then listens on the loopback
-address only, at **the runtime's port + 1**, and forwards everything to the real
-runtime. Point your client at it and its traffic is counted:
+**Counting is enabled automatically**, with no menu switch. The app listens on the
+loopback address only, at **the runtime's port + 1**, and forwards everything to the
+real runtime. Point your client at it and its traffic is counted:
 
 | Runtime | Counter address | What to change client-side |
 |---|---|---|
@@ -226,7 +223,7 @@ runtime. Point your client at it and its traffic is counted:
 Nothing is rewritten in transit — bytes are relayed **verbatim** in both directions and
 merely read on the way back, so chunked encoding, SSE streaming and keep-alive keep
 working exactly as before. The worst a mistake there can do is miscount; it cannot
-corrupt a request. Switch the option off and both ports close immediately.
+corrupt a request. Quitting the menu-bar app closes both counter ports.
 
 Two honest limits: **only traffic that goes through the counter is counted** (anything
 sent straight to `11434` / `1234` stays invisible, by construction), and the counters
@@ -277,6 +274,37 @@ usage only** — Claude Desktop chats aren't logged locally, so they aren't coun
 The whole interface is available in **English (default)** and **French**. Switch it from the
 **Language** submenu in the menu — the change is instant and remembered.
 
+## Preferences and additional providers
+
+Open **Preferences…** from the menu-bar app for a live indicator preview and an always-visible
+detailed menu preview beside the settings (no click needed). Choose its indicator, show/hide
+provider sections in the menu/widget, and toggle the token cost breakdown.
+**Add a provider… → OpenRouter** only needs a name and a standard API key; its
+usage URL is preconfigured. It reads `GET https://openrouter.ai/api/v1/key` and
+shows daily API spending (`usage_daily`), the remaining **key budget** when
+a spending cap exists (`limit_remaining / limit`), and a **daily request gauge**
+from `free_model_daily_requests.remaining / limit`. Those numbers are calculated
+by OpenRouter server-side, so they include requests made from other machines that
+use the same API key. This is not the account's credit balance and does not require
+a management key.
+[OpenRouter endpoint documentation](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key).
+
+For **Custom API**, supply a name, an HTTPS **usage endpoint**, and a key. The app
+makes a GET request with `Authorization: Bearer <key>`. Configure at least one
+dotted JSON field path: remaining quota **0–100 percent** and/or **daily cost in
+USD**, for example `data.remaining_percent` and `data.usage_daily`. A chat endpoint
+alone cannot report usage; other authentication schemes/JSON formats need an
+adapter. Redirects are refused to avoid forwarding credentials.
+
+Keys are stored in macOS Keychain, never in preferences or widget snapshots.
+Use **Edit…** to replace a key (an empty field keeps the current key), or
+**Remove…** to delete the provider and its key. Changing a custom destination
+requires re-entering its key. Connection failures are shown explicitly, not as
+zero usage. Added providers can also be selected as the menu-bar indicator.
+Their costs remain separate from the existing Claude/Codex total to avoid double
+counting. Widgets show up to five compact rows; further providers remain in the
+menu. Settings and provider definitions persist across restarts.
+
 ## Diagnostic modes (CLI)
 
 The built binary lives at `~/Applications/ClaudeUsageWidget.app/Contents/MacOS/ClaudeUsageWidget`:
@@ -286,13 +314,9 @@ ClaudeUsageWidget --once     # real /usage + ccusage call, print and exit
 ClaudeUsageWidget --mock     # no network: fake quotas + real ccusage / Codex data
 ClaudeUsageWidget --refresh  # force an OAuth token refresh + rewrite the keychain item
 ClaudeUsageWidget --notify-test  # send a sample notification
-ClaudeUsageWidget --local    # local runtimes only: what's up, what's loaded, today's counters
-ClaudeUsageWidget --local --serve  # …and hold the counter open, to send it a test request
 ```
 
-`--local` touches neither the network nor the keychain, which makes it the quick way to
-check the counter end to end: run it with `--serve` in one terminal, send a request
-through `127.0.0.1:11435`, then run plain `--local` in another to see the total move.
+
 
 ## How it's built
 
@@ -313,6 +337,5 @@ A single Swift file compiled with `swiftc` into a self-contained, ad-hoc-signed 
 
 ---
 
-*Not affiliated with Anthropic, OpenAI, Ollama or LM Studio. "Claude", "Codex", "Ollama" and
-"LM Studio" are trademarks of their respective owners. This tool only reads your own local
-usage data.*
+*Not affiliated with Anthropic, OpenAI or Ollama. "Claude", "Codex" and "Ollama" are
+trademarks of their respective owners. This tool only reads your own usage data.*
