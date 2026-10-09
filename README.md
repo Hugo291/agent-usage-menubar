@@ -235,6 +235,26 @@ Local tokens are deliberately kept **out of** the daily cost, the projection and
 widget's token-share bar: that bar compares *billed* tokens, and folding in free ones
 would make its percentages mean nothing.
 
+### Automatic model switches (`~/.ai/llm-bascules.jsonl`)
+Other tools that fall back from one LLM to another (quota hit, timeout…) can log each switch
+here; the menu then shows **"Model switches today: N"**, the switches grouped by route
+(`from → to`, count, time of the last one) and the reason of the last one underneath.
+The file is optional — no file, or no switch today, hides the section. Toggle it in
+Preferences → Visible sections ("Model switches", independent of "Local models").
+
+One JSON object per line, appended by the writer:
+
+```json
+{"ts": "2026-10-08T14:03:12+02:00", "source": "codex-app", "from": "kimi-k3:cloud", "to": "gpt-6-astra", "reason": "429 quota Ollama Cloud"}
+```
+
+- `ts` (ISO 8601, fractional seconds and missing offset accepted), `from` and `to` are required;
+  `source` (`codex-app`, `skill:use-ollama-cloud`, `llm-call`…) and `reason` are free text.
+- Invalid lines (broken JSON, missing/empty field, bad date) are ignored. Only lines of the
+  **local day** count: yesterday's disappear at midnight, like the local token counters.
+- Read at each existing local refresh (no extra timer); the file is never written by the app.
+  Parsing is covered by `tests/test_llm_switches.py`.
+
 ### Cost & tokens
 `ccusage claude daily` (Claude only — not the agent-wide `ccusage daily`, which would fold in
 Codex and others) and `ccusage codex daily` (Codex) provide today's cost and token counts. Each
@@ -297,6 +317,10 @@ alone cannot report usage; other authentication schemes/JSON formats need an
 adapter. Redirects are refused to avoid forwarding credentials.
 
 Keys are stored in macOS Keychain, never in preferences or widget snapshots.
+Keychain access never opens a password dialog. If an OpenRouter key is inaccessible,
+the app can read an existing key from `OPENROUTER_API_KEY`, `OPENROUTER_KEY`,
+`OR_API_KEY`, or OpenCode's `auth.json`, without saving another copy. This fallback
+is restricted to the validated OpenRouter usage endpoint; custom providers do not use it.
 Use **Edit…** to replace a key (an empty field keeps the current key), or
 **Remove…** to delete the provider and its key. Changing a custom destination
 requires re-entering its key. Connection failures are shown explicitly, not as
@@ -307,13 +331,13 @@ menu. Settings and provider definitions persist across restarts.
 
 ## Diagnostic modes (CLI)
 
-The built binary lives at `~/Applications/ClaudeUsageWidget.app/Contents/MacOS/ClaudeUsageWidget`:
+The built binary lives at `~/Applications/AgentUsage.app/Contents/MacOS/AgentUsage`:
 
 ```bash
-ClaudeUsageWidget --once     # real /usage + ccusage call, print and exit
-ClaudeUsageWidget --mock     # no network: fake quotas + real ccusage / Codex data
-ClaudeUsageWidget --refresh  # force an OAuth token refresh + rewrite the keychain item
-ClaudeUsageWidget --notify-test  # send a sample notification
+AgentUsage --once     # real /usage + ccusage call, print and exit
+AgentUsage --mock     # no network: fake quotas + real ccusage / Codex data
+AgentUsage --refresh  # force an OAuth token refresh + rewrite the keychain item
+AgentUsage --notify-test  # send a sample notification
 ```
 
 
@@ -325,7 +349,7 @@ A single Swift file compiled with `swiftc` into a self-contained, ad-hoc-signed 
 
 | File | Role |
 |---|---|
-| `ClaudeUsage.swift` | everything — model, fetch, menu-bar UI, notifications, i18n |
+| `AgentUsage.swift` | everything — model, fetch, menu-bar UI, notifications, i18n |
 | `install.sh` | build + install + auto-start + launch (and `uninstall`) |
 | `Info.plist` | bundle metadata (`LSUIElement`) |
 | `AppIcon.icns` | app icon |

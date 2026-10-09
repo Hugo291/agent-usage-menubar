@@ -2,6 +2,12 @@ import Cocoa
 import Network
 import UserNotifications
 import WidgetKit
+import Security
+
+// Le trousseau « session » utilise encore les API historiques sur macOS.
+// Interdit leurs dialogues pour ce processus, y compris après une recompilation.
+// Un accès non autorisé échoue ; les permissions du trousseau restent intactes.
+SecKeychainSetUserInteractionAllowed(false)
 
 // MARK: - Internationalisation (langue de l'interface)
 
@@ -154,6 +160,7 @@ enum AddedProviders {
     static func key(_ id: String) -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service, kSecAttrAccount as String: id,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var result: CFTypeRef?
         guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
@@ -162,7 +169,8 @@ enum AddedProviders {
     }
     @discardableResult static func storeKey(_ key: String?, id: String) -> OSStatus {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service, kSecAttrAccount as String: id]
+            kSecAttrService as String: service, kSecAttrAccount as String: id,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
         guard let key = key else { return SecItemDelete(q as CFDictionary) }
         let value = [kSecValueData as String: Data(key.utf8)]
         let status = SecItemUpdate(q as CFDictionary, value as CFDictionary)
@@ -170,7 +178,7 @@ enum AddedProviders {
         return SecItemAdd(q.merging(value) { _, new in new } as CFDictionary, nil)
     }
     /// Lecture ciblée : jamais d'énumération des secrets des autres fournisseurs.
-    static func importOpenRouter() -> String? {
+    static func openRouterKey() -> String? {
         var secret: String?
         for name in ["OPENROUTER_API_KEY", "OPENROUTER_KEY", "OR_API_KEY"] {
             if let value = ProcessInfo.processInfo.environment[name], !value.isEmpty { secret = value; break }
@@ -186,7 +194,11 @@ enum AddedProviders {
             }
         }
         guard let key = secret?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
-              !key.contains(where: { $0.isWhitespace }) else {
+              !key.contains(where: { $0.isWhitespace }) else { return nil }
+        return key
+    }
+    static func importOpenRouter() -> String? {
+        guard let key = openRouterKey() else {
             return I18n.t("No OpenRouter API key found in the environment or OpenCode.", "Aucune clé API OpenRouter trouvée dans l'environnement ou OpenCode.")
         }
         var list = configs
@@ -260,7 +272,8 @@ enum AddedProviders {
         guard let url = validURL(p.url, openRouter: p.openRouter) else {
             failure.error = I18n.t("Invalid HTTPS URL", "URL HTTPS invalide"); return failure
         }
-        guard let key = key(p.id), !key.isEmpty else {
+        // Repli limité à l'endpoint OpenRouter validé ci-dessus, sans écrire de secret.
+        guard let key = key(p.id) ?? (p.openRouter ? openRouterKey() : nil), !key.isEmpty else {
             failure.error = I18n.t("API key missing or inaccessible", "Clé API absente ou inaccessible"); return failure
         }
         var request = URLRequest(url: url)
@@ -402,7 +415,7 @@ enum WidgetFeed {
         put("ollamaCost4w", u.ollamaCost4w)
         put("ollamaPlan", u.ollamaPlan)
         put("ollamaAsOf", u.ollamaAsOf?.timeIntervalSince1970)
-        put("ollamaError", u.ollamaError)
+        put("ollamaError", u.ollamaAlert ?? u.ollamaError)
         d["ollamaSessionInactive"] = u.ollamaSessionInactive ?? false
         d["hiddenProviders"] = ContentPref.hidden
         if let data = try? JSONEncoder().encode(AddedProviders.readings.filter { ContentPref.visible($0.id) }),
@@ -481,6 +494,15 @@ struct Usage: Codable {
     var ollamaAsOf: Date?
     var ollamaError: String?
     var ollamaSessionInactive: Bool?
+    /// Dernier 429 d'un modèle cloud Ollama, lu dans les journaux du serveur local.
+    var ollamaLimitHit: Date?
+    var ollamaLimitModel: String?
+    /// Alerte « limite atteinte » tant que le 429 a moins de 5 h (fenêtre session).
+    var ollamaAlert: String? {
+        guard let d = ollamaLimitHit, Date().timeIntervalSince(d) < 5 * 3600 else { return nil }
+        return "⛔ " + I18n.t("Limit reached", "Limite atteinte")
+            + (ollamaLimitModel.map { " · \($0)" } ?? "") + " · " + UI.agoText(d)
+    }
     /// Coût Ollama sur les 4 DERNIÈRES SEMAINES (c'est la période que l'API renvoie,
     /// pas la journée) → à afficher tel quel, JAMAIS à additionner au total du jour.
     var ollamaCost4w: Double?
@@ -500,6 +522,8 @@ struct Usage: Codable {
     var localGPU: Double?
     /// Processus hors Ollama / LM Studio qui ont des poids de modèle chargés sur le GPU.
     var localProcs: [LocalProc]?
+    /// Bascules automatiques de modèle LLM du jour (`~/.ai/llm-bascules.jsonl`), plus anciennes d'abord.
+    var llmSwitches: [LlmSwitch]?
 
     var localTokens: Double? {
         guard let by = localByRuntime else { return nil }
@@ -881,6 +905,8 @@ enum Fetcher {
         u.localGPU = GPUProbe.utilization()
         let procs = GPUProbe.processes()
         u.localProcs = procs.isEmpty ? nil : procs
+        let sw = LlmSwitches.today()
+        u.llmSwitches = sw.isEmpty ? nil : sw
         let day = LocalUsage.today()
         // Un runtime peut avoir servi ce matin puis s'être arrêté : on garde ses
         // compteurs même s'il ne répond plus à la sonde.
@@ -978,6 +1004,16 @@ enum Fetcher {
 ///   {"activity":{"cost":"0.00000","period":{"type":"last_4_weeks",…}},
 ///    "limits":{"session":{"usage":1,…},"weekly":{"usage":0.094,…}}}
 /// `usage` est une FRACTION CONSOMMÉE (0–1), pas un pourcentage : 1 = quota épuisé.
+/// Les `bytes` derniers octets d'un fichier, en texte (la première ligne peut être
+/// tronquée, y compris au milieu d'un caractère UTF-8).
+func tailText(_ path: String, bytes: UInt64 = 1_000_000) -> String? {
+    guard let h = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? h.close() }
+    let size = (try? h.seekToEnd()) ?? 0
+    try? h.seek(toOffset: size > bytes ? size - bytes : 0)
+    return (try? h.readToEnd()).map { String(decoding: $0, as: UTF8.self) }
+}
+
 enum OllamaLimits {
     struct Reading {
         var session: Limit?
@@ -1027,6 +1063,9 @@ enum OllamaLimits {
     static func parse(_ root: [String: Any]) -> Reading {
         var r = Reading()
         guard let limits = root["limits"] as? [String: Any] else {
+            // Depuis début octobre 2026, `/api/usage` ne renvoie plus que des compteurs
+            // de requêtes, sans aucun quota : rien à afficher, Ollama cloud est masqué.
+            if root["totals"] != nil { return r }
             r.error = I18n.t("Usage format not supported", "Format de consommation non pris en charge")
             return r
         }
@@ -1057,6 +1096,37 @@ enum OllamaLimits {
         return r
     }
 
+    /// Dernier 429 d'un modèle CLOUD dans les journaux du serveur Ollama local (un
+    /// modèle local ne renvoie jamais 429) : seul signal « limite atteinte » depuis
+    /// qu'Ollama ne publie plus ses quotas.
+    /// - `codex-proxy.log` : `… route=ollama model="x" … status=429` (avec le modèle) ;
+    /// - `server.log` : lignes GIN 429 hors `/v1/responses` et `/api/codex/`, qui sont
+    ///   le trafic du proxy Codex (route ChatGPT comprise), déjà couvert ci-dessus.
+    // ponytail: un client tiers qui appelle /v1/responses en direct sur un modèle cloud
+    // n'est pas vu ; à couvrir si ça arrive.
+    static func lastRateLimit(logs: String = NSHomeDirectory() + "/.ollama/logs") -> (date: Date, model: String?)? {
+        var best: (date: Date, model: String?)?
+        func keep(_ d: Date?, _ m: String?) {
+            if let d = d, d > (best?.date ?? .distantPast) { best = (d, m) }
+        }
+        let iso = ISO8601DateFormatter()
+        for line in tailText(logs + "/codex-proxy.log")?.split(separator: "\n") ?? []
+        where line.contains("route=ollama") && line.contains("status=429") {
+            let model = line.range(of: "model=\"[^\"]*", options: .regularExpression)
+                .map { String(line[$0].dropFirst(7)) }
+            keep(line.split(separator: " ").first.flatMap { iso.date(from: String($0)) }, model)
+        }
+        let gin = DateFormatter()
+        gin.locale = Locale(identifier: "en_US_POSIX")
+        gin.dateFormat = "yyyy/MM/dd - HH:mm:ss"
+        for line in tailText(logs + "/server.log")?.split(separator: "\n") ?? []
+        where line.hasPrefix("[GIN]") && line.contains("| 429 |")
+            && !line.contains("\"/v1/responses\"") && !line.contains("/api/codex/") {
+            keep(gin.date(from: String(line.dropFirst(6).prefix(21))), nil)
+        }
+        return best
+    }
+
     static func read() -> Reading? {
         guard let key = apiKey(),
               let url = URL(string: "https://ollama.com/api/usage") else { return nil }
@@ -1084,7 +1154,9 @@ enum OllamaLimits {
         if sem.wait(timeout: .now() + 15) != .success {
             return Reading(error: I18n.t("Usage request timed out", "Délai de lecture de consommation dépassé"))
         }
-        if out != nil { out?.plan = plan(key) }
+        if let o = out, o.session != nil || o.weekly != nil || o.error != nil || o.sessionInactive {
+            out?.plan = plan(key)
+        }
         return out
     }
 }
@@ -1237,6 +1309,59 @@ struct LocalModelUse: Codable {
     var input: Double = 0
     var output: Double = 0
     var total: Double { input + output }
+}
+
+/// Une bascule automatique de modèle LLM (une ligne de `~/.ai/llm-bascules.jsonl`),
+/// écrite par d'autres outils : `{"ts": ISO 8601, "source", "from", "to", "reason"}`.
+struct LlmSwitch: Codable, Equatable {
+    var ts: Date
+    var source: String
+    var from: String
+    var to: String
+    var reason: String
+}
+
+enum LlmSwitches {
+    static var path: String { NSHomeDirectory() + "/.ai/llm-bascules.jsonl" }
+
+    static func parseDate(_ s: String) -> Date? {
+        let a = ISO8601DateFormatter()
+        if let d = a.date(from: s) { return d }
+        a.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = a.date(from: s) { return d }
+        let f = DateFormatter()                       // sans fuseau → heure locale
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return f.date(from: s)
+    }
+
+    /// Bascules du JOUR LOCAL de `now`, triées par date. Fichier absent ou ligne
+    /// invalide (JSON cassé, `ts`/`from`/`to` manquant ou vide) → ignoré, sans erreur.
+    static func today(path: String = path, now: Date = Date()) -> [LlmSwitch] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+        var out: [LlmSwitch] = []
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
+                  let ts = (obj["ts"] as? String).flatMap(parseDate),
+                  let from = obj["from"] as? String, !from.isEmpty,
+                  let to = obj["to"] as? String, !to.isEmpty,
+                  Calendar.current.isDate(ts, inSameDayAs: now) else { continue }
+            out.append(LlmSwitch(ts: ts, source: obj["source"] as? String ?? "",
+                                 from: from, to: to, reason: obj["reason"] as? String ?? ""))
+        }
+        return out.sorted { $0.ts < $1.ts }
+    }
+
+    /// Regroupe par trajet « from → to » : nombre, dernière bascule ; la plus récente d'abord.
+    static func grouped(_ list: [LlmSwitch]) -> [(route: String, count: Int, last: LlmSwitch)] {
+        var by: [String: (Int, LlmSwitch)] = [:]
+        for s in list {
+            let k = "\(s.from) → \(s.to)"
+            by[k] = ((by[k]?.0 ?? 0) + 1, s)          // `list` est trié : la dernière écrase
+        }
+        return by.map { (route: $0.key, count: $0.value.0, last: $0.value.1) }
+            .sorted { $0.last.ts > $1.last.ts }
+    }
 }
 
 /// Le compteur du jour, par runtime puis par modèle. `day` est une date LOCALE
@@ -1478,7 +1603,13 @@ final class LocalRelay {
                 self.sniffer.consume(d)
                 self.client.send(content: d, completion: .contentProcessed { if $0 != nil { self.close() } })
             }
-            if isComplete || error != nil { self.close(); return }
+            if isComplete || error != nil {
+                // Fermer seulement après le départ des derniers octets : cancel() jetterait les envois
+                // en attente (réponse « Connection: close » amputée de sa fin → IncompleteRead côté client).
+                self.client.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                                 completion: .contentProcessed { _ in self.close() })
+                return
+            }
             self.pumpDown()
         }
     }
@@ -1812,15 +1943,9 @@ enum CodexLimits {
 
     /// Lectures issues de la queue (≤ 1 Mo) d'un fichier de session.
     private static func cliReadings(_ url: URL) -> [Reading] {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return [] }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        let tail: UInt64 = 1_000_000
-        try? h.seek(toOffset: size > tail ? size - tail : 0)
-        guard let data = try? h.readToEnd() else { return [] }
         // La queue peut commencer au milieu d’un caractère UTF-8 ; seule cette
         // première ligne incomplète doit être ignorée, pas tout le relevé.
-        let text = String(decoding: data, as: UTF8.self)
+        guard let text = tailText(url.path) else { return [] }
         var out: [Reading] = []
         for line in text.split(separator: "\n") where line.contains("rate_limits") {
             guard let d = line.data(using: .utf8),
@@ -1874,11 +1999,12 @@ enum CodexLimits {
               let epoch = Double(s[..<sepRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines))
         else { return nil }
         let body = String(s[sepRange.upperBound...])
+        // Codex a d'abord journalisé `"X-Codex-…":"v"`, puis `"x-codex-…": "v"` :
+        // casse et espace après les deux-points ignorés.
         func hdr(_ key: String) -> String? {
-            guard let r = body.range(of: key + "\":\"") else { return nil }
-            let rest = body[r.upperBound...]
-            guard let end = rest.firstIndex(of: "\"") else { return nil }
-            return String(rest[..<end])
+            guard let r = body.range(of: "\"" + key + "\"\\s*:\\s*\"[^\"]*",
+                                     options: [.regularExpression, .caseInsensitive]) else { return nil }
+            return body[r].split(separator: "\"", omittingEmptySubsequences: false).last.map(String.init)
         }
         var r = Reading(epoch: epoch)
         // Même principe que côté CLI : on classe par durée de fenêtre, pas par position.
@@ -2058,13 +2184,132 @@ enum UI {
 
 // MARK: - App
 
+/// Logos téléchargés et embarqués : aucun chargement réseau dans l'interface.
+enum ProviderIcons {
+    static func image(_ id: String, size: CGFloat = 16, appearance: NSAppearance? = nil) -> NSImage? {
+        let files = ["claude": "claude.ico", "codex": "codex.png", "ollama": "ollama.png", "openrouter": "openrouter.png"]
+        guard let file = files[id] else {
+            return NSImage(systemSymbolName: id == "local" ? "desktopcomputer" : "network", accessibilityDescription: nil)
+        }
+        let directories = [Bundle.main.resourceURL?.appendingPathComponent("ProviderIcons"),
+                           URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ProviderIcons")]
+        // `.lazy` : sans lui, la copie des sources (~/Documents) était lue aussi → demande d'accès macOS bloquant le lancement.
+        guard let source = directories.lazy.compactMap({ $0 }).compactMap({ NSImage(contentsOf: $0.appendingPathComponent(file)) }).first else { return nil }
+        let image = NSImage(size: NSSize(width: size, height: size))
+        let draw = {
+            image.lockFocus()
+            let scale = min(size / source.size.width, size / source.size.height)
+            let rect = NSRect(x: (size - source.size.width * scale) / 2, y: (size - source.size.height * scale) / 2,
+                              width: source.size.width * scale, height: source.size.height * scale)
+            source.draw(in: rect)
+            if id == "codex" || id == "openrouter" {
+                NSColor.labelColor.setFill()
+                NSRect(x: 0, y: 0, width: size, height: size).fill(using: .sourceIn)
+            }
+            image.unlockFocus()
+        }
+        if let appearance = appearance { appearance.performAsCurrentDrawingAppearance(draw) } else { draw() }
+        return image
+    }
+    static func attachment(_ id: String, size: CGFloat = 14, appearance: NSAppearance? = nil) -> NSAttributedString {
+        guard let image = image(id, size: size, appearance: appearance) else { return NSAttributedString(string: "") }
+        let attachment = NSTextAttachment()
+        attachment.image = image; attachment.bounds = NSRect(x: 0, y: -3, width: size, height: size)
+        return NSAttributedString(attachment: attachment)
+    }
+}
+
+/// Bureau miniature : reprend le fond d'écran du Mac quand il est disponible.
+final class MacDesktopPreview: NSView {
+    private let wallpaper = NSScreen.main.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        .flatMap { NSImage(contentsOf: $0) }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func draw(_ dirtyRect: NSRect) {
+        if let image = wallpaper, image.size.width > 0, image.size.height > 0 {
+            let scale = max(bounds.width / image.size.width, bounds.height / image.size.height)
+            let size = NSSize(width: bounds.width / scale, height: bounds.height / scale)
+            let crop = NSRect(x: (image.size.width - size.width) / 2,
+                              y: (image.size.height - size.height) / 2, width: size.width, height: size.height)
+            image.draw(in: bounds, from: crop, operation: .sourceOver, fraction: 1)
+        } else {
+            NSGradient(colors: [NSColor(red: 0.10, green: 0.18, blue: 0.48, alpha: 1),
+                                NSColor(red: 0.48, green: 0.32, blue: 0.78, alpha: 1),
+                                NSColor(red: 0.98, green: 0.61, blue: 0.48, alpha: 1)])?.draw(in: bounds, angle: 35)
+            let wave = NSBezierPath()
+            wave.move(to: .zero)
+            wave.line(to: NSPoint(x: bounds.width, y: 0))
+            wave.line(to: NSPoint(x: bounds.width, y: bounds.height * 0.65))
+            wave.curve(to: NSPoint(x: 0, y: bounds.height * 0.3),
+                       controlPoint1: NSPoint(x: bounds.width * 0.65, y: bounds.height * 0.95),
+                       controlPoint2: NSPoint(x: bounds.width * 0.25, y: bounds.height * 0.05))
+            wave.close()
+            NSColor(red: 0.16, green: 0.12, blue: 0.48, alpha: 0.45).setFill()
+            wave.fill()
+        }
+    }
+}
+
+/// Interrupteur dont l'état reste lisible même dans une fenêtre inactive.
+/// NSButton conserve la gestion du clic, du clavier et de l'accessibilité.
+final class PrefSwitch: NSButton {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setButtonType(.switch)
+        title = ""
+        isBordered = false
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var intrinsicContentSize: NSSize { NSSize(width: 44, height: 24) }
+    override var state: NSControl.StateValue { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = bounds.insetBy(dx: 1, dy: 1)
+        let on = state == .on
+        let color: NSColor = on ? .systemBlue : .quaternaryLabelColor
+        if isEnabled { color.setFill() } else { color.withAlphaComponent(0.4).setFill() }
+        NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+        let size = track.height - 4
+        let x = on ? track.maxX - size - 2 : track.minX + 2
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: track.minY + 2, width: size, height: size)).fill()
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 11, yRadius: 11).fill()
+    }
+    override var focusRingMaskBounds: NSRect { bounds }
+}
+
+/// Carte arrondie des préférences ; les couleurs suivent l'apparence (clair/sombre).
+final class PrefCard: NSView {
+    var fill: NSColor = .controlBackgroundColor
+    override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        layer?.cornerRadius = 10; layer?.borderWidth = 1
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = fill.cgColor
+            layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+}
+
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
 /// Copie les lignes déjà rendues du vrai menu, sans déplacer ses vues ni ses actions.
 /// Un document retourné donne un aperçu défilable même avec beaucoup de fournisseurs.
 final class MenuPreviewDocument: NSView {
     override var isFlipped: Bool { true }
-
+    
     init(items: [NSMenuItem]) {
-        let width = max(CGFloat(350), (items.compactMap { $0.view?.frame.width }.max() ?? 0) + 16)
+        let width = max(CGFloat(250), (items.compactMap { $0.view?.frame.width }.max() ?? 0) + 16)
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 0))
         var y: CGFloat = 8
         for item in items {
@@ -2077,6 +2322,9 @@ final class MenuPreviewDocument: NSView {
                 let row = NSView(frame: NSRect(x: 8, y: y, width: width - 16, height: original.frame.height))
                 for field in original.subviews.compactMap({ $0 as? NSTextField }) {
                     let copy = NSTextField(labelWithAttributedString: field.attributedStringValue)
+                    copy.maximumNumberOfLines = field.maximumNumberOfLines
+                    copy.lineBreakMode = field.lineBreakMode
+                    copy.preferredMaxLayoutWidth = field.preferredMaxLayoutWidth
                     copy.frame = field.frame
                     copy.isSelectable = false
                     copy.toolTip = field.toolTip
@@ -2086,7 +2334,6 @@ final class MenuPreviewDocument: NSView {
                 addSubview(row)
                 y += row.frame.height
             } else {
-                // Les commandes sont montrées comme dans le menu, mais non exécutables.
                 let title = item.title + (item.submenu == nil ? "" : "  ›")
                 let field = NSTextField(labelWithString: title)
                 field.font = NSFont.menuFont(ofSize: 13)
@@ -2098,7 +2345,7 @@ final class MenuPreviewDocument: NSView {
         frame.size.height = y + 8
         setAccessibilityLabel(I18n.t("Detailed menu preview", "Aperçu du menu détaillé"))
     }
-
+    
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
@@ -2205,9 +2452,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         codexReading = true
         DispatchQueue.global().async {
             let limits = CodexLimits.read()
+            let hit = OllamaLimits.lastRateLimit()
             DispatchQueue.main.async {
                 self.codexReading = false
                 guard var u = self.lastUsage else { return }
+                if let hit, hit.date != u.ollamaLimitHit {
+                    let isNew = u.ollamaLimitHit.map { hit.date > $0 } ?? true
+                    u.ollamaLimitHit = hit.date; u.ollamaLimitModel = hit.model
+                    // Pas de notif pour un vieux 429 découvert au lancement.
+                    if isNew && Date().timeIntervalSince(hit.date) < 600 {
+                        Notifier.shared.send(title: "⛔ Ollama cloud · " + I18n.t("limit reached", "limite atteinte"),
+                                             body: (hit.model.map { $0 + " · " } ?? "") + I18n.t("Requests are refused (HTTP 429).", "Les requêtes sont refusées (HTTP 429)."))
+                    }
+                    self.lastUsage = u
+                    Cache.save(u, at: self.lastUpdate ?? Date())
+                    WidgetFeed.publish(u, updated: self.lastUpdate ?? Date())
+                    self.updateTitle(u)
+                    if self.menuOpen { self.pendingLocalRebuild = true } else { self.rebuildMenu(usage: u) }
+                }
                 let changed = u.codexAsOf != limits.asOf
                     || u.codexFiveHour?.utilization != limits.fiveHour?.utilization
                     || u.codexSevenDay?.utilization != limits.sevenDay?.utilization
@@ -2233,7 +2495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let counted = (u.localByRuntime ?? [:]).sorted { $0.key < $1.key }
             .map { "\($0.key):\($0.value.keys.sorted())" }
         let procs = (u.localProcs ?? []).map { "\($0.pid)\($0.model)" }
-        return "\(u.localDetected ?? [])|\(loaded)|\(counted)|\(procs)"
+        return "\(u.localDetected ?? [])|\(loaded)|\(counted)|\(procs)|\(u.llmSwitches ?? [])"
     }
 
     /// Relit SEULEMENT la partie locale (Ollama / LM Studio / GPU, sans réseau sortant).
@@ -2242,7 +2504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         localProbing = true
         DispatchQueue.global(qos: .userInitiated).async {
             u.localDetected = nil; u.localLoaded = nil; u.localExpiry = nil
-            u.localGPU = nil; u.localProcs = nil
+            u.localGPU = nil; u.localProcs = nil; u.llmSwitches = nil
             Fetcher.readLocal(into: &u)
             DispatchQueue.main.async {
                 self.localProbing = false
@@ -2254,6 +2516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 cur.localByRuntime = u.localByRuntime
                 cur.localGPU = u.localGPU
                 cur.localProcs = u.localProcs
+                cur.llmSwitches = u.llmSwitches
                 self.lastUsage = cur
                 if self.localShape(cur) == before { return }   // les lignes vivantes suffisent
                 if self.menuOpen { self.pendingLocalRebuild = true } else { self.rebuildMenu(usage: cur) }
@@ -2368,17 +2631,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateTitle(_ usage: Usage) {
         defer { updatePreferencesPreview() }
-        if let id = UserDefaults.standard.string(forKey: "customBarProvider"),
-           let p = AddedProviders.configs.first(where: { $0.id == id }) {
-            let r = AddedProviders.readings.first { $0.id == id }
-            let value = r?.remaining.map { String(format: "%.0f%%", $0) }
-                ?? r?.dailyCost.map { UI.humanCost($0, decimals: 2) } ?? "—"
-            statusItem.button?.title = p.name + " " + (r?.error == nil ? value : "⚠︎")
-            return
-        }
         guard let button = statusItem.button else { return }
         let appearance = button.effectiveAppearance
         let mono = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        if let id = UserDefaults.standard.string(forKey: "customBarProvider"),
+           let provider = AddedProviders.configs.first(where: { $0.id == id }) {
+            let r = AddedProviders.readings.first { $0.id == id }
+            var remaining = r?.remaining
+            if provider.openRouter, let requests = r?.dailyRequestsRemaining,
+               let limit = r?.dailyRequestLimit, limit > 0 {
+                remaining = max(0, min(100, requests / limit * 100))
+            }
+            let value = remaining.map { String(format: "%.0f%%", $0) }
+                ?? r?.dailyCost.map { UI.humanCost($0, decimals: 2) } ?? "—"
+            let color = r?.error == nil ? UI.barColor(forRemaining: remaining ?? 100) : .systemRed
+            let title = NSMutableAttributedString()
+            if provider.openRouter,
+               let image = iconImage("calendar", color: color, appearance: appearance) {
+                let attachment = NSTextAttachment()
+                attachment.image = image
+                attachment.bounds = NSRect(x: 0, y: (mono.capHeight - image.size.height) / 2,
+                                           width: image.size.width, height: image.size.height)
+                title.append(NSAttributedString(attachment: attachment))
+                title.append(NSAttributedString(string: " ", attributes: [.font: mono]))
+            }
+            title.append(NSAttributedString(string: r?.error == nil ? value : "⚠︎",
+                                            attributes: [.font: mono, .foregroundColor: color]))
+            button.attributedTitle = title
+            return
+        }
         let s = NSMutableAttributedString()
 
         func segment(symbol: String, fallback: String, limit: Limit?) {
@@ -2428,8 +2709,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             codexSegments()
             cost = usage.codexTodayCost
         case .ollama:
-            if usage.ollamaError != nil {
-                s.append(NSAttributedString(string: "Ollama ⚠︎", attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
+            if usage.ollamaAlert != nil || usage.ollamaError != nil {
+                s.append(NSAttributedString(string: usage.ollamaAlert != nil ? "Ollama ⛔" : "Ollama ⚠︎", attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor]))
                 cost = nil
                 break
             }
@@ -2461,7 +2742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Ligne d'affichage colorée et non grisée (NSTextField dans un view custom).
     private func displayItem(_ attr: NSAttributedString, indent: CGFloat = 20,
-                             toolTip: String? = nil) -> NSMenuItem {
+                             toolTip: String? = nil, wrapWidth: CGFloat? = nil) -> NSMenuItem {
         let item = NSMenuItem()
         let field = NSTextField(labelWithAttributedString: attr)
         field.isBezeled = false
@@ -2469,9 +2750,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         field.isEditable = false
         field.isSelectable = false
         field.sizeToFit()
-        let width = max(CGFloat(264), field.frame.width + indent + 18)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: field.frame.height + 6))
-        field.frame.origin = NSPoint(x: indent, y: 3)
+        if let wrapWidth = wrapWidth {
+            field.maximumNumberOfLines = 0
+            field.lineBreakMode = .byWordWrapping
+            field.preferredMaxLayoutWidth = wrapWidth
+            let bounds = attr.boundingRect(with: NSSize(width: wrapWidth - 4, height: 10_000),
+                                           options: [.usesLineFragmentOrigin, .usesFontLeading])
+            field.frame.size = NSSize(width: wrapWidth, height: ceil(bounds.height) + 2)
+        }
+        let width = max(CGFloat(236), field.frame.width + indent + 18)
+        // Resserre les lignes du mode compact, y compris dans l’aperçu des préférences.
+        let verticalInset: CGFloat = DetailedMenuStyle.current == .compact ? 1 : 3
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: field.frame.height + verticalInset * 2))
+        field.frame.origin = NSPoint(x: indent, y: verticalInset)
         container.addSubview(field)
         if let t = toolTip { container.toolTip = t; field.toolTip = t }
         item.view = container
@@ -2516,9 +2807,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// En-tête d'un fournisseur : nom (gras) à gauche, coût du jour (discret) à droite.
+    /// Colonne des montants, à 236 points de l'origine de la ligne (indent de 16).
+    /// Mode compact : colonnes fixes (origines : quota 16 pt, en-têtes 20 pt). Libellé (icône + « session »)
+    /// à 62 pt, barre de 64 pt, « % » aligné à droite à 162 pt, puis « ↻ dans … » collé à droite
+    /// (aligné à droite, donc un reset plus long ne décale rien). Les montants se calent sur ce même bord.
+    private var compactResetRight: CGFloat {
+        let sample = NSAttributedString(string: I18n.t("↻ in 130 h 41", "↻ dans 130 h 41"),
+                                        attributes: [.font: NSFont.systemFont(ofSize: 10)])
+        return ceil(162 + 8 + sample.size().width)
+    }
+    private var rightTab: CGFloat {
+        DetailedMenuStyle.current == .compact ? compactResetRight - 4 : 236
+    }
+
     private func providerHeader(_ name: String, cost: Double?, toolTip: String? = nil) -> NSMenuItem {
         let para = NSMutableParagraphStyle()
-        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
+        para.tabStops = [NSTextTab(textAlignment: .right, location: rightTab)]
         let s = NSMutableAttributedString(string: name, attributes: [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.labelColor, .paragraphStyle: para])
@@ -2554,7 +2858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func tokenBreakdownItems(_ rows: [Split]?) -> [NSMenuItem] {
         guard let rows = rows else { return [] }
         let para = NSMutableParagraphStyle()
-        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
+        // Le détail est indenté de 16 points de plus que l'en-tête.
+        para.tabStops = [NSTextTab(textAlignment: .right, location: rightTab - 16)]
         return rows.map { r in
             let s = NSMutableAttributedString(string: r.label, attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
@@ -2575,16 +2880,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func compactQuota(symbol: String, label: String, limit: Limit?, toolTip: String? = nil) -> [NSMenuItem] {
         let compact = DetailedMenuStyle.current == .compact
         let para = NSMutableParagraphStyle()
-        para.tabStops = [NSTextTab(textAlignment: .left, location: 60),
-                         NSTextTab(textAlignment: .right, location: compact ? 180 : 244)]
-        if compact { para.tabStops.append(NSTextTab(textAlignment: .right, location: 300)) }
+        para.tabStops = [NSTextTab(textAlignment: .left, location: compact ? 62 : 60),
+                         NSTextTab(textAlignment: .right, location: compact ? 162 : 216)]
+        if compact { para.tabStops.append(NSTextTab(textAlignment: .right, location: compactResetRight)) }   // colonne « ↻ » alignée à droite
         let s = NSMutableAttributedString(attributedString: rowIcon(symbol))
         s.append(NSAttributedString(string: " " + label, attributes: [
             .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
         if let l = limit {
             let color = UI.color(forRemaining: l.remaining)
             s.append(NSAttributedString(string: "\t"))
-            s.append(barAttachment(remaining: l.remaining, color: color, width: compact ? 80 : 150))
+            s.append(barAttachment(remaining: l.remaining, color: color, width: compact ? 64 : 150))
             s.append(NSAttributedString(string: "\t" + String(format: "%.0f%%", l.remaining), attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color]))
         } else {
@@ -2608,11 +2913,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func headerItem() -> NSMenuItem {
-        let attr = NSAttributedString(string: "Usage — Claude + Codex", attributes: [
+        let builtIn = [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama")]
+        var providers = builtIn.filter { ContentPref.visible($0.0) }
+        providers += AddedProviders.configs.filter { ContentPref.visible($0.id) }.map { ($0.openRouter ? "openrouter" : $0.id, $0.name) }
+        if ContentPref.visible("local") { providers.append(("local", I18n.t("Local models", "Modèles locaux"))) }
+        let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .bold),
             .foregroundColor: NSColor.secondaryLabelColor,
-        ])
-        return displayItem(attr, indent: 14)
+        ]
+        let attr = NSMutableAttributedString(string: providers.isEmpty ? "Usage" : "Usage — ", attributes: attributes)
+        for (index, provider) in providers.enumerated() {
+            if index > 0 { attr.append(NSAttributedString(string: "  ", attributes: attributes)) }
+            attr.append(ProviderIcons.attachment(provider.0, appearance: NSApp.effectiveAppearance))
+        }
+        return displayItem(attr, indent: 14, toolTip: providers.map { $0.1 }.joined(separator: " · "), wrapWidth: 236)
     }
 
     private func footerItems() -> [NSMenuItem] {
@@ -2630,23 +2944,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 attributes: [.font: NSFont.systemFont(ofSize: 10),
                              .foregroundColor: NSColor.tertiaryLabelColor]), indent: 14))
         }
-        items.append(.separator())
+        if !items.isEmpty { items.append(.separator()) }   // sinon double séparateur
         let preferences = NSMenuItem(title: I18n.t("Preferences…", "Préférences…"), action: #selector(openPreferences), keyEquivalent: ",")
         preferences.target = self
         items.append(preferences)
-
-        // Sous-menu de langue.
-        let langItem = NSMenuItem(title: I18n.t("Language", "Langue"), action: nil, keyEquivalent: "")
-        let langMenu = NSMenu()
-        for l in Lang.allCases {
-            let it = NSMenuItem(title: l.menuTitle, action: #selector(changeLanguage(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = l.rawValue
-            it.state = (l == I18n.current) ? .on : .off
-            langMenu.addItem(it)
-        }
-        langItem.submenu = langMenu
-        items.append(langItem)
 
         let refreshItem = NSMenuItem(title: I18n.t("Refresh", "Rafraîchir"), action: #selector(forceRefresh), keyEquivalent: "r")
         refreshItem.target = self
@@ -2663,7 +2964,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var preferencesWindow: NSWindow?
+    private var preferencesSettingsScroll: NSScrollView?
     private var preferencesPreview: NSTextField?
+    private var desktopBarPreview: NSTextField?
     private var detailedPreviewScroll: NSScrollView?
     private var preferencesPreviewTimer: Timer?
 
@@ -2680,9 +2983,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updatePreferencesPreview() {
-        guard let button = statusItem.button, let preview = preferencesPreview else { return }
-        preview.attributedStringValue = button.attributedTitle
-        preview.appearance = button.effectiveAppearance
+        guard let button = statusItem.button else { return }
+        for preview in [preferencesPreview, desktopBarPreview].compactMap({ $0 }) {
+            let rendered = NSMutableAttributedString(attributedString: button.attributedTitle)
+            // Les symboles de la vraie barre peuvent être blancs sur un fond sombre.
+            // Les résout pour l'apparence du bureau simulé, sans modifier les originaux.
+            rendered.enumerateAttribute(.attachment, in: NSRange(location: 0, length: rendered.length)) { value, range, _ in
+                guard let original = value as? NSTextAttachment, let source = original.image else { return }
+                let image = NSImage(size: source.size)
+                preview.effectiveAppearance.performAsCurrentDrawingAppearance {
+                    image.lockFocus()
+                    let rect = NSRect(origin: .zero, size: source.size)
+                    source.draw(in: rect)
+                    NSColor.labelColor.setFill()
+                    rect.fill(using: .sourceIn)
+                    image.unlockFocus()
+                }
+                let attachment = NSTextAttachment()
+                attachment.image = image; attachment.bounds = original.bounds
+                rendered.addAttribute(.attachment, value: attachment, range: range)
+            }
+            preview.attributedStringValue = rendered
+            preview.alignment = .center
+        }
     }
 
     @objc private func openPreferences() {
@@ -2693,127 +3016,315 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func buildPreferences() {
-        let oldOrigin = preferencesWindow?.frame.origin
+        let isNewWindow = preferencesWindow == nil
+        let wasVisible = preferencesWindow?.isVisible == true
+        let settingsOffset = preferencesSettingsScroll?.contentView.bounds.origin ?? .zero
+        let previewOffset = detailedPreviewScroll?.contentView.bounds.origin ?? .zero
         preferencesPreviewTimer?.invalidate()
-        preferencesWindow?.close()
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 680),
-            styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        // Réutilise la fenêtre : traduire les réglages ne doit pas la fermer/rouvrir.
+        let window = preferencesWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 740),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = I18n.t("Agent Usage — Preferences", "Agent Usage — Préférences")
         window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 980, height: 580)
         preferencesWindow = window
         let configs = AddedProviders.configs
-        let height = CGFloat(max(680, 550 + configs.count * 38))
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 920, height: 680))
-        window.contentView = content
-        let previewTitle = NSTextField(labelWithString: I18n.t("Detailed menu — live preview", "Menu détaillé — aperçu en direct"))
-        previewTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        previewTitle.frame = NSRect(x: 546, y: 641, width: 350, height: 22)
-        content.addSubview(previewTitle)
-        let background = NSVisualEffectView(frame: NSRect(x: 540, y: 20, width: 360, height: 609))
-        background.material = .menu
-        background.blendingMode = .withinWindow
-        background.state = .active
-        background.wantsLayer = true
-        background.layer?.cornerRadius = 10
-        background.layer?.masksToBounds = true
-        content.addSubview(background)
-        let detailScroll = NSScrollView(frame: background.bounds)
-        detailScroll.hasVerticalScroller = true
-        detailScroll.hasHorizontalScroller = true
-        detailScroll.autohidesScrollers = true
-        detailScroll.drawsBackground = false
-        background.addSubview(detailScroll)
-        detailedPreviewScroll = detailScroll
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 680))
-        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
-        let document = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: height))
-        scroll.documentView = document
-        content.addSubview(scroll)
-        var y = height - 36
-        func label(_ text: String, bold: Bool = false) {
-            let field = NSTextField(labelWithString: text)
-            field.frame = NSRect(x: 24, y: y, width: 460, height: 22)
-            field.font = NSFont.systemFont(ofSize: bold ? 13 : 11, weight: bold ? .semibold : .regular)
-            document.addSubview(field); y -= 30
+        let content = NSView()
+
+        func text(_ s: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
+            let f = NSTextField(labelWithString: s)
+            f.font = .systemFont(ofSize: size, weight: weight); f.textColor = color
+            f.lineBreakMode = .byTruncatingTail
+            f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            return f
         }
-        label(I18n.t("Live menu-bar preview", "Aperçu en direct de la barre de menus"), bold: true)
-        let bar = NSBox(frame: NSRect(x: 24, y: y - 18, width: 450, height: 46))
-        bar.boxType = .custom
-        bar.cornerRadius = 8; bar.fillColor = .windowBackgroundColor
-        bar.borderColor = .separatorColor
-        bar.appearance = statusItem.button?.effectiveAppearance
-        let preview = NSTextField(labelWithString: "")
-        preview.frame = NSRect(x: 16, y: 12, width: 418, height: 22)
+        func vstack(_ views: [NSView], spacing: CGFloat, inset: CGFloat = 0) -> NSStackView {
+            let s = NSStackView(views: views)
+            s.orientation = .vertical; s.alignment = .leading; s.spacing = spacing
+            s.edgeInsets = NSEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
+            for v in views { v.widthAnchor.constraint(equalTo: s.widthAnchor, constant: -2 * inset).isActive = true }
+            return s
+        }
+        func card(_ title: String, _ hint: String?, _ rows: [NSView]) -> NSView {
+            var head: [NSView] = [text(title, weight: .semibold)]
+            if let hint = hint { head.append(text(hint, size: 11, color: .secondaryLabelColor)) }
+            let stack = vstack([vstack(head, spacing: 4)] + rows, spacing: 10, inset: 16)
+            let box = PrefCard()
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            box.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.topAnchor.constraint(equalTo: box.topAnchor), stack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+                stack.leadingAnchor.constraint(equalTo: box.leadingAnchor), stack.trailingAnchor.constraint(equalTo: box.trailingAnchor)])
+            return box
+        }
+        func providerLabel(_ title: String, id: String) -> NSTextField {
+            let label = text(title)
+            let value = NSMutableAttributedString(attributedString: ProviderIcons.attachment(id, size: 16, appearance: window.effectiveAppearance))
+            value.append(NSAttributedString(string: "  " + title, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor]))
+            label.attributedStringValue = value
+            return label
+        }
+        func row(_ title: String, _ control: NSView, width: CGFloat? = nil, iconID: String? = nil) -> NSView {
+            let label = iconID.map { providerLabel(title, id: $0) } ?? text(title)
+            label.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            control.setContentHuggingPriority(.required, for: .horizontal)
+            if let width = width { control.widthAnchor.constraint(equalToConstant: width).isActive = true }
+            let s = NSStackView(views: [label, control])
+            s.orientation = .horizontal; s.alignment = .centerY; s.spacing = 12
+            return s
+        }
+        func toggle(_ title: String, id: String, on: Bool, action: Selector) -> NSView {
+            let sw = PrefSwitch()
+            sw.setAccessibilityLabel(title)
+            sw.state = on ? .on : .off
+            sw.identifier = NSUserInterfaceItemIdentifier(id)
+            sw.target = self; sw.action = action
+            return row(title, sw, iconID: id == "tokens" ? nil : id)
+        }
+
+        func glass(_ material: NSVisualEffectView.Material, radius: CGFloat = 0) -> NSVisualEffectView {
+            let view = NSVisualEffectView()
+            view.material = material; view.blendingMode = .withinWindow; view.state = .active
+            view.wantsLayer = true; view.layer?.cornerRadius = radius; view.layer?.masksToBounds = true
+            return view
+        }
+        func macMenuBar(_ indicator: NSTextField, compact: Bool) -> NSView {
+            let bar = glass(.headerView)
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            func menuText(_ value: String, bold: Bool = false) -> NSTextField {
+                let label = text(value)
+                let font = NSFont.menuBarFont(ofSize: 0)
+                label.font = bold ? NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) : font
+                return label
+            }
+            var items: [NSView] = [menuText(""), menuText("Finder", bold: true)]
+            if !compact {
+                items += [menuText(I18n.t("File", "Fichier")), menuText(I18n.t("Edit", "Édition"))]
+            }
+            let wifi = NSImageView(image: NSImage(systemSymbolName: "wifi", accessibilityDescription: nil) ?? NSImage())
+            wifi.widthAnchor.constraint(equalToConstant: 14).isActive = true
+            wifi.heightAnchor.constraint(equalToConstant: 14).isActive = true
+            let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+            indicator.setContentHuggingPriority(.required, for: .horizontal)
+            indicator.setContentCompressionResistancePriority(.required, for: .horizontal)
+            items += [spacer, wifi, indicator, menuText(clock.string(from: Date()))]
+            let stack = NSStackView(views: items)
+            stack.orientation = .horizontal; stack.alignment = .centerY; stack.spacing = compact ? 10 : 12
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            bar.addSubview(stack)
+            NSLayoutConstraint.activate([
+                bar.heightAnchor.constraint(equalToConstant: 30),
+                stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+                stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+                stack.centerYAnchor.constraint(equalTo: bar.centerYAnchor)])
+            return bar
+        }
+        func dock() -> NSView {
+            let dock = glass(.hudWindow, radius: 10)
+            let paths = ["/System/Library/CoreServices/Finder.app", "/System/Applications/Notes.app",
+                         "/System/Applications/System Settings.app", "/System/Applications/Utilities/Terminal.app"]
+            let icons: [NSView] = paths.map { path in
+                let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: path))
+                icon.imageScaling = .scaleProportionallyUpOrDown
+                icon.widthAnchor.constraint(equalToConstant: 26).isActive = true
+                icon.heightAnchor.constraint(equalToConstant: 26).isActive = true
+                return icon
+            }
+            let stack = NSStackView(views: icons)
+            stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false
+            dock.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.leadingAnchor.constraint(equalTo: dock.leadingAnchor, constant: 8),
+                stack.trailingAnchor.constraint(equalTo: dock.trailingAnchor, constant: -8),
+                stack.topAnchor.constraint(equalTo: dock.topAnchor, constant: 6),
+                stack.bottomAnchor.constraint(equalTo: dock.bottomAnchor, constant: -6)])
+            return dock
+        }
+
+        // Barre de menus
+        let preview = text("")
         preview.alignment = .center
-        bar.contentView?.addSubview(preview)
         preferencesPreview = preview
-        document.addSubview(bar)
+        let bar = MacDesktopPreview()
+        let simulatedBar = macMenuBar(preview, compact: false)
+        simulatedBar.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(simulatedBar)
+        NSLayoutConstraint.activate([
+            bar.heightAnchor.constraint(equalToConstant: 110),
+            simulatedBar.topAnchor.constraint(equalTo: bar.topAnchor),
+            simulatedBar.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
+            simulatedBar.trailingAnchor.constraint(equalTo: bar.trailingAnchor)])
         updatePreferencesPreview()
-        y -= 42
-        label(I18n.t("Detailed menu always visible on the right →", "Menu détaillé toujours visible à droite →"))
-        y -= 23
-        label(I18n.t("Menu-bar indicator", "Indicateur dans la barre de menus"), bold: true)
-        let popup = NSPopUpButton(frame: NSRect(x: 24, y: y, width: 450, height: 26))
+        let popup = NSPopUpButton()
         for p in BarProvider.allCases {
             popup.addItem(withTitle: p.menuTitle); popup.lastItem?.representedObject = p.rawValue
+            if p != .total { popup.lastItem?.image = ProviderIcons.image(p.rawValue, appearance: window.effectiveAppearance) }
         }
         for p in configs {
             popup.addItem(withTitle: p.name); popup.lastItem?.representedObject = "custom:" + p.id
+            popup.lastItem?.image = ProviderIcons.image(p.openRouter ? "openrouter" : p.id, appearance: window.effectiveAppearance)
         }
         let selected = UserDefaults.standard.string(forKey: "customBarProvider").map { "custom:" + $0 } ?? BarPref.current.rawValue
         if let item = popup.itemArray.first(where: { ($0.representedObject as? String) == selected }) { popup.select(item) }
         popup.target = self; popup.action = #selector(preferenceBarChanged(_:))
-        document.addSubview(popup); y -= 40
-        label(I18n.t("Detailed menu version", "Version du menu détaillé"), bold: true)
-        let style = NSPopUpButton(frame: NSRect(x: 24, y: y, width: 450, height: 26))
+        let barCard = card(I18n.t("Menu bar", "Barre de menus"), I18n.t("What the status item shows, live.", "Ce que l'icône affiche, en direct."),
+                           [bar, row(I18n.t("Indicator", "Indicateur"), popup, width: 230)])
+
+        // Menu détaillé
+        let style = NSPopUpButton()
         for mode in DetailedMenuStyle.allCases {
             style.addItem(withTitle: mode.title); style.lastItem?.representedObject = mode.rawValue
         }
         style.selectItem(at: DetailedMenuStyle.allCases.firstIndex(of: DetailedMenuStyle.current) ?? 0)
         style.target = self; style.action = #selector(preferenceMenuStyleChanged(_:))
-        document.addSubview(style); y -= 40
-        label(I18n.t("Sections shown in the menu", "Sections affichées dans le menu"), bold: true)
-        for (id, title) in [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama"), ("local", I18n.t("Local models", "Modèles locaux"))] {
-            let box = NSButton(checkboxWithTitle: title, target: self, action: #selector(preferenceVisibilityChanged(_:)))
-            box.identifier = NSUserInterfaceItemIdentifier(id)
-            box.state = ContentPref.visible(id) ? .on : .off
-            box.frame = NSRect(x: 24, y: y, width: 450, height: 22)
-            document.addSubview(box); y -= 27
+
+        // Langue
+        let langPopup = NSPopUpButton()
+        for l in Lang.allCases {
+            langPopup.addItem(withTitle: l.menuTitle); langPopup.lastItem?.representedObject = l.rawValue
         }
-        let tokens = NSButton(checkboxWithTitle: I18n.t("Show cost by token type", "Afficher le coût par type de token"), target: self, action: #selector(preferenceTokensChanged(_:)))
-        tokens.state = TokenBreakdownPref.enabled ? .on : .off
-        tokens.frame = NSRect(x: 24, y: y, width: 450, height: 22)
-        document.addSubview(tokens); y -= 37
-        label(I18n.t("Additional providers", "Fournisseurs supplémentaires"), bold: true)
-        for p in configs {
-            let box = NSButton(checkboxWithTitle: p.name, target: self, action: #selector(preferenceVisibilityChanged(_:)))
-            box.identifier = NSUserInterfaceItemIdentifier(p.id)
-            box.state = ContentPref.visible(p.id) ? .on : .off
-            box.frame = NSRect(x: 24, y: y, width: 240, height: 24)
-            document.addSubview(box)
-            for (x, title, action) in [(CGFloat(277), I18n.t("Edit…", "Modifier…"), #selector(preferenceEdit(_:))),
-                                       (CGFloat(379), I18n.t("Remove…", "Supprimer…"), #selector(preferenceRemove(_:)))] {
-                let button = NSButton(title: title, target: self, action: action)
-                button.bezelStyle = .rounded
-                button.identifier = NSUserInterfaceItemIdentifier(p.id)
-                button.frame = NSRect(x: x, y: y, width: 100, height: 27)
-                document.addSubview(button)
+        langPopup.selectItem(withTitle: I18n.current.menuTitle)
+        langPopup.target = self; langPopup.action = #selector(preferenceLanguageChanged(_:))
+        let menuCard = card(I18n.t("Menu display", "Affichage du menu"),
+                            I18n.t("Changes appear in the preview on the right.", "Les changements sont visibles dans l'aperçu à droite."), [
+            row(I18n.t("Layout", "Présentation"), style, width: 230),
+            row(I18n.t("Language", "Langue"), langPopup, width: 230),
+            toggle(I18n.t("Cost by token type", "Coût par type de token"), id: "tokens",
+                   on: TokenBreakdownPref.enabled, action: #selector(preferenceTokensChanged(_:)))])
+
+        // Sections
+        let sections = [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama"), ("local", I18n.t("Local models", "Modèles locaux")),
+                        ("switches", I18n.t("Model switches", "Bascules de modèles"))]
+        let sectionsCard = card(I18n.t("Visible sections", "Sections visibles"), I18n.t("Choose which providers appear in the menu.", "Choisis les fournisseurs à afficher dans le menu."),
+            sections.map { toggle($0.1, id: $0.0, on: ContentPref.visible($0.0), action: #selector(preferenceVisibilityChanged(_:))) })
+
+        // Fournisseurs
+        var providerRows: [NSView] = configs.map { p in
+            let name = providerLabel(p.name, id: p.openRouter ? "openrouter" : p.id)
+            name.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            let buttons: [NSView] = [(I18n.t("Edit…", "Modifier…"), #selector(preferenceEdit(_:))),
+                                     (I18n.t("Remove…", "Supprimer…"), #selector(preferenceRemove(_:)))].map { title, action in
+                let b = NSButton(title: title, target: self, action: action)
+                b.bezelStyle = .rounded; b.controlSize = .small
+                b.identifier = NSUserInterfaceItemIdentifier(p.id)
+                return b
             }
-            y -= 38
+            let sw = PrefSwitch()
+            sw.setAccessibilityLabel(I18n.t("Show \(p.name)", "Afficher \(p.name)"))
+            sw.state = ContentPref.visible(p.id) ? .on : .off
+            sw.identifier = NSUserInterfaceItemIdentifier(p.id)
+            sw.target = self; sw.action = #selector(preferenceVisibilityChanged(_:))
+            let s = NSStackView(views: [name] + buttons + [sw])
+            s.orientation = .horizontal; s.alignment = .centerY; s.spacing = 8
+            return s
+        }
+        if providerRows.isEmpty {
+            providerRows = [text(I18n.t("None yet.", "Aucun pour l'instant."), size: 11, color: .secondaryLabelColor)]
         }
         let add = NSButton(title: I18n.t("+ Add a provider…", "+ Ajouter un fournisseur…"), target: self, action: #selector(addProvider))
-        add.bezelStyle = .rounded; add.frame = NSRect(x: 24, y: y, width: 240, height: 30)
-        document.addSubview(add)
-        y -= 36
-        let importKey = NSButton(title: I18n.t("Import OpenRouter (environment / OpenCode)", "Importer OpenRouter (env. / OpenCode)"), target: self, action: #selector(importOpenRouter))
-        importKey.bezelStyle = .rounded
-        importKey.frame = NSRect(x: 24, y: y, width: 360, height: 30)
-        document.addSubview(importKey)
-        if let origin = oldOrigin { window.setFrameOrigin(origin) } else { window.center() }
-        document.scroll(NSPoint(x: 0, y: height))
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        let importKey = NSButton(title: I18n.t("Import OpenRouter", "Importer OpenRouter"), target: self, action: #selector(importOpenRouter))
+        for button in [add, importKey] { button.bezelStyle = .rounded; button.controlSize = .small }
+        importKey.toolTip = I18n.t("From environment / OpenCode", "Depuis l'environnement / OpenCode")
+        let actions = NSStackView(views: [add, importKey])
+        actions.orientation = .horizontal; actions.spacing = 8
+        let providersCard = card(I18n.t("Additional providers", "Fournisseurs supplémentaires"),
+                                 I18n.t("Manage connections and their visibility in the menu.", "Gère les connexions et leur visibilité dans le menu."), providerRows + [actions])
+
+        let cards = vstack([barCard, menuCard, sectionsCard, providersCard], spacing: 12)
+        let document = FlippedView()
+        cards.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(cards)
+        let scroll = NSScrollView()
+        preferencesSettingsScroll = scroll
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
+        scroll.documentView = document
+        document.translatesAutoresizingMaskIntoConstraints = false
+        let clip = scroll.contentView
+        NSLayoutConstraint.activate([
+            document.topAnchor.constraint(equalTo: clip.topAnchor), document.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+            cards.topAnchor.constraint(equalTo: document.topAnchor, constant: 20), cards.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -20),
+            cards.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 20), cards.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -20)])
+
+        // Aperçu du menu détaillé
+        let heading = text(I18n.t("Preferences", "Préférences"), size: 22, weight: .bold)
+        let subtitle = text(I18n.t("Customize your menu bar and its detailed menu.", "Personnalise ta barre de menus et son menu détaillé."), size: 12, color: .secondaryLabelColor)
+        let previewTitle = text(I18n.t("Live preview", "Aperçu en direct"), size: 15, weight: .semibold)
+        let previewHint = text(I18n.t("Your menu, with current usage data.", "Ton menu, avec les données de consommation actuelles."), size: 11, color: .secondaryLabelColor)
+        let detailScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 360, height: 560))
+        detailScroll.autoresizingMask = [.width, .height]
+        detailScroll.hasVerticalScroller = true
+        detailScroll.hasHorizontalScroller = true
+        detailScroll.autohidesScrollers = true
+        detailScroll.drawsBackground = false
+        detailedPreviewScroll = detailScroll
+        let side = PrefCard()
+        let desktop = MacDesktopPreview()
+        let desktopIndicator = text("")
+        desktopBarPreview = desktopIndicator
+        let desktopMenuBar = macMenuBar(desktopIndicator, compact: true)
+        let menuSurface = glass(.menu, radius: 8)
+        let simulatedDock = dock()
+        for v in [desktopMenuBar, menuSurface, simulatedDock] {
+            v.translatesAutoresizingMaskIntoConstraints = false; desktop.addSubview(v)
+        }
+        detailScroll.translatesAutoresizingMaskIntoConstraints = false
+        menuSurface.addSubview(detailScroll)
+        for v in [previewTitle, previewHint, desktop] { v.translatesAutoresizingMaskIntoConstraints = false; side.addSubview(v) }
+        updatePreferencesPreview()
+        for v in [heading, subtitle] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        side.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(scroll); content.addSubview(side)
+        NSLayoutConstraint.activate([
+            heading.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
+            heading.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            subtitle.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 6),
+            subtitle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
+            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
+            scroll.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 4), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: side.leadingAnchor),
+            side.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 20), side.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            side.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20), side.widthAnchor.constraint(equalToConstant: 330),
+            previewTitle.topAnchor.constraint(equalTo: side.topAnchor, constant: 16),
+            previewTitle.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 16), previewTitle.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -16),
+            previewHint.topAnchor.constraint(equalTo: previewTitle.bottomAnchor, constant: 4),
+            previewHint.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor), previewHint.trailingAnchor.constraint(equalTo: previewTitle.trailingAnchor),
+            desktop.topAnchor.constraint(equalTo: previewHint.bottomAnchor, constant: 14),
+            desktop.bottomAnchor.constraint(equalTo: side.bottomAnchor, constant: -16),
+            desktop.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 16),
+            desktop.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -16),
+            desktopMenuBar.topAnchor.constraint(equalTo: desktop.topAnchor),
+            desktopMenuBar.leadingAnchor.constraint(equalTo: desktop.leadingAnchor),
+            desktopMenuBar.trailingAnchor.constraint(equalTo: desktop.trailingAnchor),
+            menuSurface.topAnchor.constraint(equalTo: desktopMenuBar.bottomAnchor, constant: 6),
+            menuSurface.trailingAnchor.constraint(equalTo: desktop.trailingAnchor, constant: -10),
+            menuSurface.leadingAnchor.constraint(equalTo: desktop.leadingAnchor, constant: 18),
+            menuSurface.bottomAnchor.constraint(equalTo: simulatedDock.topAnchor, constant: -12),
+            detailScroll.topAnchor.constraint(equalTo: menuSurface.topAnchor, constant: 4),
+            detailScroll.bottomAnchor.constraint(equalTo: menuSurface.bottomAnchor, constant: -4),
+            detailScroll.leadingAnchor.constraint(equalTo: menuSurface.leadingAnchor),
+            detailScroll.trailingAnchor.constraint(equalTo: menuSurface.trailingAnchor),
+            simulatedDock.centerXAnchor.constraint(equalTo: desktop.centerXAnchor),
+            simulatedDock.bottomAnchor.constraint(equalTo: desktop.bottomAnchor, constant: -10)])
+
+        // Remplace le contenu terminé en une fois, sans exposer une page vide.
+        window.contentView = content
+        if isNewWindow { window.center() }
+        if !wasVisible {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+        }
+        content.layoutSubtreeIfNeeded()
         rebuildMenu(usage: lastUsage ?? Usage())
+        updateDetailedMenuPreview()
+        for (scroller, offset) in [(scroll, settingsOffset), (detailScroll, previewOffset)] {
+            let height = scroller.documentView?.frame.height ?? 0
+            scroller.contentView.scroll(to: NSPoint(x: offset.x,
+                y: min(offset.y, max(0, height - scroller.contentSize.height))))
+            scroller.reflectScrolledClipView(scroller.contentView)
+        }
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] timer in
             guard let self = self, self.preferencesWindow?.isVisible == true else { timer.invalidate(); return }
             self.refreshLocal()
@@ -2828,6 +3339,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(raw, forKey: "detailedMenuStyle")
         publishPreferences()
     }
+    @objc private func preferenceLanguageChanged(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String, let l = Lang(rawValue: raw) else { return }
+        I18n.set(l)
+        publishPreferences()
+    }
     @objc private func importOpenRouter() {
         if let error = AddedProviders.importOpenRouter() { providerMessage(error); return }
         refreshAddedProviders(force: true)
@@ -2839,6 +3355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateTitle(u)
         rebuildMenu(usage: u)
         WidgetFeed.publish(u, updated: lastUpdate ?? Date())
+        if preferencesWindow?.isVisible == true { buildPreferences() }
     }
     @objc private func preferenceVisibilityChanged(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
@@ -3095,7 +3612,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let w = u.codexSevenDay {
             items += compactQuota(symbol: "calendar", label: I18n.t("week", "hebdo"), limit: w)
         }
-        if hasQuota, let asOf = u.codexAsOf {
+        // Compact : l'âge du relevé n'apparaît que s'il commence à dater.
+        if hasQuota, let asOf = u.codexAsOf,
+           DetailedMenuStyle.current != .compact || Date().timeIntervalSince(asOf) > 900 {
             items.append(displayItem(NSAttributedString(
                 string: I18n.t("last reading \(UI.agoText(asOf))", "dernier relevé \(UI.agoText(asOf))"),
                 attributes: [.font: NSFont.systemFont(ofSize: 10),
@@ -3113,14 +3632,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Section Ollama Cloud : affichée UNIQUEMENT si une clé API est configurée
     /// (sinon on n'a rien à montrer). Pas de ligne de reset : l'API n'en publie pas.
     private func ollamaItems(_ u: Usage) -> [NSMenuItem] {
-        guard u.ollamaSession != nil || u.ollamaWeekly != nil || u.ollamaError != nil || u.ollamaSessionInactive == true else { return [] }
+        guard u.ollamaSession != nil || u.ollamaWeekly != nil || u.ollamaError != nil || u.ollamaAlert != nil || u.ollamaSessionInactive == true else { return [] }
         let name = u.ollamaPlan.map { "Ollama · \($0)" } ?? "Ollama · cloud"
         var items: [NSMenuItem] = [providerHeader(name, cost: nil,
             toolTip: I18n.t("Cloud quotas remaining, not local model usage", "Quotas cloud restants, pas la consommation des modèles locaux"))]
         func note(_ text: String) -> NSMenuItem {
             displayItem(NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]), indent: 16)
         }
-        if let error = u.ollamaError { items.append(note(error)); return items }
+        if let error = u.ollamaAlert ?? u.ollamaError { items.append(note(error)); return items }
         if u.ollamaSessionInactive == true { items.append(note(I18n.t("Session inactive — no requests in this window", "Session inactive — aucune requête dans cette fenêtre"))) }
         if u.ollamaSession != nil {
             items += compactQuota(symbol: "bolt", label: I18n.t("session", "session"),
@@ -3149,6 +3668,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
+    /// « Bascules aujourd'hui : N » puis un trajet « from → to » par ligne (×N · heure de la
+    /// dernière) avec la raison de la dernière en sous-titre. Vide si aucune bascule du jour.
+    private func switchItems(_ u: Usage) -> [NSMenuItem] {
+        guard let list = u.llmSwitches, !list.isEmpty else { return [] }
+        func line(_ label: String, _ value: String, indent: CGFloat, size: CGFloat, color: NSColor) -> NSMenuItem {
+            let para = NSMutableParagraphStyle()
+            para.tabStops = [NSTextTab(textAlignment: .right, location: rightTab - (indent - 16))]
+            para.lineBreakMode = .byTruncatingMiddle
+            let s = NSMutableAttributedString(string: label, attributes: [
+                .font: NSFont.systemFont(ofSize: size), .foregroundColor: color, .paragraphStyle: para])
+            if !value.isEmpty {
+                s.append(NSAttributedString(string: "\t" + value, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular),
+                    .foregroundColor: color, .paragraphStyle: para]))
+            }
+            return self.displayItem(s, indent: indent)
+        }
+        let hm = DateFormatter()
+        hm.locale = I18n.locale
+        hm.dateFormat = "HH:mm"
+        var items = [line(I18n.t("Model switches today: \(list.count)", "Bascules aujourd'hui : \(list.count)"), "",
+                          indent: 16, size: 12, color: .labelColor)]
+        for g in LlmSwitches.grouped(list).prefix(6) {
+            items.append(line(g.route, "×\(g.count)  ·  \(hm.string(from: g.last.ts))",
+                              indent: 28, size: 11, color: .secondaryLabelColor))
+            if !g.last.reason.isEmpty {
+                items.append(self.displayItem(NSAttributedString(string: g.last.reason, attributes: [
+                    .font: NSFont.systemFont(ofSize: 10),
+                    .foregroundColor: NSColor.tertiaryLabelColor]), indent: 44))
+            }
+        }
+        return items
+    }
+
     /// Section « Modèles locaux » (Ollama local + LM Studio). Elle apparaît dès qu'un
     /// runtime répond OU qu'on a compté quelque chose aujourd'hui, et reste absente
     /// sinon — comme Ollama Cloud sans clé. Aucune colonne de dollars : ces modèles
@@ -3159,10 +3712,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let procs = u.localProcs ?? []
         guard !detected.isEmpty || !counted.isEmpty || !procs.isEmpty else { return [] }
 
-        let para = NSMutableParagraphStyle()
-        para.tabStops = [NSTextTab(textAlignment: .right, location: 244)]
-
-        func attr(_ label: String, _ value: String, size: CGFloat, color: NSColor) -> NSAttributedString {
+        let compact = DetailedMenuStyle.current == .compact
+        func attr(_ label: String, _ value: String, size: CGFloat, color: NSColor, indent: CGFloat) -> NSAttributedString {
+            // La tabulation est relative à l'origine du champ : on retire l'indentation
+            // en trop pour que tous les montants finissent au même bord droit.
+            let para = NSMutableParagraphStyle()
+            para.tabStops = [NSTextTab(textAlignment: .right, location: rightTab - (indent - 16))]
             let s = NSMutableAttributedString(string: label, attributes: [
                 .font: NSFont.systemFont(ofSize: size), .foregroundColor: color,
                 .paragraphStyle: para])
@@ -3175,16 +3730,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         /// Ligne « libellé … valeur », valeur alignée à droite.
         func row(_ label: String, _ value: String, indent: CGFloat,
                  size: CGFloat, color: NSColor) -> NSMenuItem {
-            self.displayItem(attr(label, value, size: size, color: color), indent: indent)
+            self.displayItem(attr(label, value, size: size, color: color, indent: indent), indent: indent)
         }
 
         /// Ligne redessinée chaque seconde menu ouvert ; `value` relit `lastUsage`.
         func liveRow(_ label: String, indent: CGFloat, size: CGFloat, color: NSColor,
                      value: @escaping (Usage) -> String) -> NSMenuItem {
             let render: () -> NSAttributedString = { [weak self] in
-                attr(label, (self?.lastUsage).map(value) ?? "", size: size, color: color)
+                attr(label, (self?.lastUsage).map(value) ?? "", size: size, color: color, indent: indent)
             }
-            let item = self.displayItem(attr(label, value(u), size: size, color: color), indent: indent)
+            let item = self.displayItem(attr(label, value(u), size: size, color: color, indent: indent), indent: indent)
             if let f = item.view?.subviews.first as? NSTextField { self.liveRows.append((f, render)) }
             return item
         }
@@ -3197,6 +3752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // En-tête : total de tokens du jour à droite — là où les autres sections
         // affichent des dollars, pour garder la même colonne de lecture.
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: rightTab)]
         let head = NSMutableAttributedString(string: I18n.t("Local models", "Modèles locaux"),
             attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold),
                          .foregroundColor: NSColor.labelColor, .paragraphStyle: para])
@@ -3214,6 +3771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let models = counted[rt.rawValue] ?? [:]
             let isUp = detected.contains(rt)
             guard isUp || !models.isEmpty else { continue }
+            if compact && models.isEmpty { continue }   // « rien de compté » n'apprend rien
             let name = rt.displayName + (isUp ? "" : I18n.t(" · stopped", " · arrêté"))
             let value = models.isEmpty
                 ? I18n.t("nothing counted", "rien de compté")
@@ -3254,16 +3812,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Le compteur démarre automatiquement ; seul le trafic qui le traverse est visible.
+        // Compact : ces notes de diagnostic passent dans l'infobulle de l'en-tête.
         let listening = LocalCounter.shared.running
+        var hints: [String] = []
         for rt in (detected.isEmpty ? LocalRuntime.allCases : detected) {
             if !listening.contains(rt) {
-                items.append(note(I18n.t("\(rt.displayName): port \(rt.counterPort) unavailable — not counting",
-                                         "\(rt.displayName) : port \(rt.counterPort) indisponible — pas de comptage"),
-                                  indent: 28))
+                hints.append(I18n.t("\(rt.displayName): port \(rt.counterPort) unavailable — not counting",
+                                    "\(rt.displayName) : port \(rt.counterPort) indisponible — pas de comptage"))
             } else if (counted[rt.rawValue] ?? [:]).isEmpty {
-                items.append(note("\(rt.displayName) → \(rt.clientHint)", indent: 28))
+                hints.append("\(rt.displayName) → \(rt.clientHint)")
             }
         }
+        if compact {
+            if !hints.isEmpty, let head = items.first?.view {
+                head.toolTip = ([head.toolTip ?? ""] + hints).joined(separator: "\n")
+            }
+            return items
+        }
+        for hint in hints { items.append(note(hint, indent: 28)) }
         return items
     }
     /// Les résumés utilisent les mêmes quotas que le mode normal : aucune estimation.
@@ -3295,7 +3861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("claude", "Claude", cost: u.todayCost, windows: [("5h", u.fiveHour), (I18n.t("week", "hebdo"), u.sevenDay)], details: claudeItems(u))
         add("codex", "Codex", cost: u.codexTodayCost, windows: [("5h", u.codexFiveHour), (I18n.t("week", "hebdo"), u.codexSevenDay)], details: codexItems(u))
         add("ollama", "Ollama", cost: nil, windows: [(I18n.t("session", "session"), u.ollamaSession), (I18n.t("week", "hebdo"), u.ollamaWeekly)],
-            status: u.ollamaError ?? (u.ollamaSessionInactive == true ? I18n.t("session inactive", "session inactive") : nil), details: ollamaItems(u))
+            status: u.ollamaAlert ?? u.ollamaError ?? (u.ollamaSessionInactive == true ? I18n.t("session inactive", "session inactive") : nil), details: ollamaItems(u))
         for r in AddedProviders.readings {
             var details = [providerHeader(r.name, cost: r.dailyCost)]
             if let error = r.error { details.append(displayItem(NSAttributedString(string: error))) }
@@ -3311,6 +3877,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let local = localItems(u)
         let localStatus = u.localTokens.map { UI.humanTokens($0) + " tokens" } ?? I18n.t("no tokens counted", "aucun token compté")
         add("local", I18n.t("Local models", "Modèles locaux"), cost: nil, windows: [], status: localStatus, details: local)
+        add("switches", I18n.t("Model switches", "Bascules de modèles"), cost: nil, windows: [],
+            status: u.llmSwitches.map { "\($0.count)" }, details: switchItems(u))
         return result
     }
 
@@ -3370,9 +3938,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             let local = localItems(u)
-            if ContentPref.visible("local") && !local.isEmpty {
+            let switches = switchItems(u)
+            let showLocal = ContentPref.visible("local") && !local.isEmpty
+            let showSwitches = ContentPref.visible("switches") && !switches.isEmpty
+            if showLocal || showSwitches {
                 menu.addItem(.separator())
-                for item in local { menu.addItem(item) }
+                if showLocal { for item in local { menu.addItem(item) } }
+                if showLocal && showSwitches { menu.addItem(.separator()) }
+                if showSwitches { for item in switches { menu.addItem(item) } }
             }
             }
             // Pied : coût total du jour (Claude + Codex) + projection.
@@ -3502,7 +4075,7 @@ if CommandLine.arguments.contains("--notify-test") {
     }
     RunLoop.main.run(until: Date().addingTimeInterval(3))
     print("Notification envoyée — vérifie le coin haut-droit / le centre de notifications.")
-    print("Si rien n'apparaît : Réglages Système ▸ Notifications ▸ Claude Usage → autoriser.")
+    print("Si rien n'apparaît : Réglages Système ▸ Notifications ▸ Agent Usage → autoriser.")
     exit(0)
 }
 
@@ -3527,6 +4100,8 @@ if CommandLine.arguments.contains("--local") {
     for p in u.localProcs ?? [] {
         print("              \(p.model)  [\(p.engine)]  \(p.program) · pid \(p.pid) · depuis \(UI.elapsed(Date().timeIntervalSince1970 - p.started))")
     }
+    let sw = LlmSwitches.today()
+    print("Bascules du jour : \(sw.count)" + LlmSwitches.grouped(sw).map { "\n  \($0.route) ×\($0.count) (\($0.last.reason))" }.joined())
     let day = LocalUsage.today()
     if day.runtimes.isEmpty {
         print("Compteurs du jour : vides.")

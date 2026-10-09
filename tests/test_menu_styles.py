@@ -2,7 +2,7 @@
 import pathlib
 import subprocess
 import tempfile
-source = (pathlib.Path(__file__).resolve().parents[1] / 'ClaudeUsage.swift').read_text()
+source = (pathlib.Path(__file__).resolve().parents[1] / 'AgentUsage.swift').read_text()
 source = source[:source.index('// `--once` :')]
 source = source.replace('UserDefaults.standard.string(forKey: "detailedMenuStyle")', 'TestStyle.value')
 source = source.replace('static func visible(_ id: String) -> Bool { !hidden.contains(id) }', 'static func visible(_ id: String) -> Bool { true }')

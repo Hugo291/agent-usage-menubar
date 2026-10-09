@@ -3,11 +3,20 @@ import pathlib
 import subprocess
 import tempfile
 
-source = (pathlib.Path(__file__).resolve().parents[1] / 'ClaudeUsage.swift').read_text()
+source = (pathlib.Path(__file__).resolve().parents[1] / 'AgentUsage.swift').read_text()
 source = source[:source.index('// `--once` :')]
-source = source.replace('let key = key(p.id)', 'let key = Optional("test-only-key")')
+# Simulate a denied Keychain and an existing OpenCode key without reading real secrets.
+start = source.index('    static func key(_ id: String)')
+end = source.index('    @discardableResult static func storeKey', start)
+source = source[:start] + '    static func key(_ id: String) -> String? { nil }\n' + source[end:]
+start = source.index('    static func openRouterKey()')
+end = source.index('    static func importOpenRouter()', start)
+source = source[:start] + '    static func openRouterKey() -> String? { "test-only-key" }\n' + source[end:]
 source = source.replace('let config = URLSessionConfiguration.ephemeral', 'let config = URLSessionConfiguration.ephemeral\n        config.protocolClasses = [FixtureProtocol.self]')
 source += r'''
+var keychainInteraction = DarwinBoolean(true)
+assert(SecKeychainGetUserInteractionAllowed(&keychainInteraction) == errSecSuccess)
+assert(!keychainInteraction.boolValue, "provider refreshes must never open a Keychain password dialog")
 final class FixtureProtocol: URLProtocol {
     static var status = 200
     static var body = "{\"data\":{\"usage_daily\":2.5,\"limit\":100,\"limit_remaining\":75,\"free_model_daily_requests\":{\"limit\":50,\"remaining\":38}}}"
@@ -32,6 +41,7 @@ assert(unlimitedReading.error == nil && unlimitedReading.remaining == nil && unl
 let byok: [String: Any] = ["data": ["limit": 10, "limit_remaining": 2, "usage_daily": 1, "byok_usage_daily": 9, "free_model_daily_requests": ["limit": 1000, "remaining": 1000]]]
 assert(AddedProviders.parse(byok, provider: p).dailyCost == 1, "do not mislabel BYOK as billed spending")
 let custom = AddedProvider(name: "Custom", url: "https://example.com/usage", openRouter: false, remainingPath: "data.remaining", dailyCostPath: "data.cost")
+assert(AddedProviders.read(custom).error != nil, "never send the OpenCode OpenRouter key to a custom provider")
 let good: [String: Any] = ["data": ["remaining": "42", "cost": 1.25]]
 let c = AddedProviders.parse(good, provider: custom)
 assert(c.error == nil && c.remaining == 42 && c.dailyCost == 1.25)

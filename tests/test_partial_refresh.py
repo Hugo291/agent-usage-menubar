@@ -3,7 +3,7 @@ import pathlib
 import subprocess
 import tempfile
 
-source = (pathlib.Path(__file__).resolve().parents[1] / 'ClaudeUsage.swift').read_text()
+source = (pathlib.Path(__file__).resolve().parents[1] / 'AgentUsage.swift').read_text()
 start = source.index('    static func fetch(previous:')
 end = source.index('// MARK: - Quotas Ollama Cloud', start)
 fetch = source[start:end]

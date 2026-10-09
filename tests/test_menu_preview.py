@@ -3,7 +3,7 @@ import pathlib
 import subprocess
 import tempfile
 
-source = (pathlib.Path(__file__).resolve().parents[1] / 'ClaudeUsage.swift').read_text()
+source = (pathlib.Path(__file__).resolve().parents[1] / 'AgentUsage.swift').read_text()
 start = source.index('final class MenuPreviewDocument:')
 end = source.index('final class AppDelegate:', start)
 swift = 'import Cocoa\nenum I18n { static func t(_ en: String, _ fr: String) -> String { en } }\n' + source[start:end]

@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Claude Usage</string>
+    <string>Agent Usage</string>
     <key>CFBundleDisplayName</key>
-    <string>Claude Usage</string>
+    <string>Agent Usage</string>
     <key>CFBundleIdentifier</key>
     <string>com.hugo.claudeusagewidget</string>
     <key>CFBundleExecutable</key>
-    <string>ClaudeUsageWidget</string>
+    <string>AgentUsage</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>

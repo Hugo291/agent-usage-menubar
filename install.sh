@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------- config ----
-APP_NAME="ClaudeUsageWidget"
+APP_NAME="AgentUsage"
 BUNDLE_ID="com.hugo.claudeusagewidget"        # must match the cache dir used in the code
 WIDGET_NAME="AgentUsageWidget"
 WIDGET_ID="$BUNDLE_ID.widget"                 # must match WidgetFeed.extensionBundleID
@@ -69,7 +69,7 @@ fi
 # --------------------------------------------------------- source bootstrap ---
 # Run standalone (e.g. `curl … | bash`, so the source isn't next to us)?
 # Fetch it into a temp dir and build from there; clean it up at the end.
-if [ -z "${SRC_DIR:-}" ] || [ ! -f "$SRC_DIR/ClaudeUsage.swift" ]; then
+if [ -z "${SRC_DIR:-}" ] || [ ! -f "$SRC_DIR/AgentUsage.swift" ]; then
   command -v git >/dev/null 2>&1 \
     || die "git not found — needed to download the source. Install the Xcode Command Line Tools:  xcode-select --install"
   say "Downloading the widget source…"
@@ -87,9 +87,10 @@ STAGE="$(mktemp -d)/$APP_NAME.app"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC_DIR/Info.plist" "$STAGE/Contents/Info.plist"
 [ -f "$SRC_DIR/AppIcon.icns" ] && cp "$SRC_DIR/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
+[ ! -d "$SRC_DIR/ProviderIcons" ] || cp -R "$SRC_DIR/ProviderIcons" "$STAGE/Contents/Resources/ProviderIcons"
 
 swiftc -O -swift-version 5 \
-    "$SRC_DIR/ClaudeUsage.swift" \
+    "$SRC_DIR/AgentUsage.swift" \
     -o "$STAGE/Contents/MacOS/$APP_NAME" \
     -framework Cocoa \
     -framework UserNotifications \
