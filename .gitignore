@@ -16,3 +16,4 @@ clawd.svg
 
 # Editor / misc
 *.swp
+.playwright-mcp/
