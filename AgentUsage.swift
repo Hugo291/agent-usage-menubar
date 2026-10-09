@@ -56,7 +56,7 @@ enum BarProvider: String, CaseIterable {
         case .claude: return "Claude"
         case .codex:  return "Codex"
         case .ollama: return "Ollama"
-        case .total:  return I18n.t("Total cost", "Coût cumulé")
+        case .total:  return I18n.t("Today's total cost", "Coût total du jour")
         }
     }
 }
@@ -123,6 +123,15 @@ struct AddedProvider: Codable {
     var openRouter: Bool
     var remainingPath: String = ""
     var dailyCostPath: String = ""
+}
+
+struct DetectedProvider {
+    enum Kind { case builtIn(String), openRouter(hasKey: Bool), added, custom }
+    var name: String
+    var source: String
+    var url: String
+    var kind: Kind
+    var dedupe = ""
 }
 
 struct ProviderReading: Codable {
@@ -211,6 +220,87 @@ enum AddedProviders {
         if existing == nil { list.append(provider) }
         save(list)
         return nil
+    }
+
+    /// Fournisseurs configurés dans les outils IA (OpenCode, Codex, environnement).
+    /// Ne lit que des noms et des URL ; la seule clé reprise est celle d'OpenRouter, via openRouterKey().
+    static func detect() -> [DetectedProvider] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var found: [(id: String, name: String, url: String, source: String)] = []
+        let data = (ProcessInfo.processInfo.environment["XDG_DATA_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? home.appendingPathComponent(".local/share")).appendingPathComponent("opencode/auth.json")
+        if let d = try? Data(contentsOf: data), let root = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            found += root.keys.sorted().map { ($0, $0, "", "OpenCode") }
+        }
+        let config = (ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? home.appendingPathComponent(".config")).appendingPathComponent("opencode")
+        for file in ["opencode.json", "opencode.jsonc"] {
+            guard let text = try? String(contentsOf: config.appendingPathComponent(file), encoding: .utf8),
+                  let root = jsonc(text) as? [String: Any], let providers = root["provider"] as? [String: Any] else { continue }
+            for (id, value) in providers.sorted(by: { $0.key < $1.key }) {
+                let entry = value as? [String: Any]
+                let url = ((entry?["options"] as? [String: Any])?["baseURL"] as? String) ?? ""
+                found.append((id, (entry?["name"] as? String) ?? id, url, "OpenCode"))
+            }
+        }
+        if let toml = try? String(contentsOf: home.appendingPathComponent(".codex/config.toml"), encoding: .utf8) {
+            var current: String?
+            for line in toml.split(separator: "\n").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+                if line.hasPrefix("[") { current = line.hasPrefix("[model_providers.") ? String(line.dropFirst(17).dropLast()) : nil
+                    if let id = current { found.append((id, id, "", "Codex")) }
+                } else if current != nil, line.hasPrefix("base_url"), let q = line.split(separator: "\"").dropFirst().first {
+                    found[found.count - 1].url = String(q)
+                }
+            }
+        }
+        if ["OPENROUTER_API_KEY", "OPENROUTER_KEY", "OR_API_KEY"].contains(where: { ProcessInfo.processInfo.environment[$0] != nil }) {
+            found.append(("openrouter", "OpenRouter", "", I18n.t("Environment", "Environnement")))
+        }
+        var seen = Set<String>(), result: [DetectedProvider] = []
+        for f in found {
+            let name = f.id.lowercased() == "openrouter" ? "OpenRouter" : f.name
+            let item = DetectedProvider(name: name, source: f.source, url: f.url, kind: classify(f.id, name: f.name, url: f.url))
+            let key: String
+            switch item.kind { case .builtIn(let section): key = "builtin:" + section; case .openRouter: key = "openrouter"; default: key = f.id.lowercased() }
+            if let i = result.firstIndex(where: { $0.dedupe == key }) {
+                if !result[i].source.contains(f.source) { result[i].source += " · " + f.source }
+                continue
+            }
+            if seen.insert(key).inserted { var item = item; item.dedupe = key; result.append(item) }
+        }
+        return result
+    }
+    static func classify(_ id: String, name: String, url: String) -> DetectedProvider.Kind {
+        let text = (id + " " + name + " " + url).lowercased()
+        let host = URL(string: url)?.host?.lowercased() ?? ""
+        if text.contains("openrouter") { return configs.contains { $0.openRouter } ? .added : .openRouter(hasKey: openRouterKey() != nil) }
+        if configs.contains(where: { $0.name.lowercased() == name.lowercased() }) { return .added }
+        if ["127.0.0.1", "localhost", "::1"].contains(host) || text.contains("lmstudio") || text.contains("lm studio") {
+            return .builtIn(I18n.t("Local models", "Modèles locaux"))
+        }
+        if text.contains("ollama") { return .builtIn("Ollama") }
+        if text.contains("codex") || text.contains("openai") { return .builtIn("Codex") }
+        if text.contains("anthropic") || text.contains("claude") { return .builtIn("Claude") }
+        return .custom
+    }
+    /// JSON avec commentaires et virgules finales (format d'OpenCode).
+    static func jsonc(_ text: String) -> Any? {
+        var out = "", inString = false, escaped = false
+        let chars = Array(text); var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if inString {
+                out.append(c)
+                if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == "\"" { inString = false }
+            } else if c == "\"" { inString = true; out.append(c) }
+            else if c == "/", i + 1 < chars.count, chars[i + 1] == "/" { while i < chars.count, chars[i] != "\n" { i += 1 }; continue }
+            else if c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
+                i += 2; while i + 1 < chars.count, !(chars[i] == "*" && chars[i + 1] == "/") { i += 1 }; i += 2; continue
+            } else { out.append(c) }
+            i += 1
+        }
+        out = out.replacingOccurrences(of: ",\\s*([}\\]])", with: "$1", options: .regularExpression)
+        return try? JSONSerialization.jsonObject(with: Data(out.utf8))
     }
 
     static func validURL(_ text: String, openRouter: Bool) -> URL? {
@@ -2265,13 +2355,13 @@ final class PrefSwitch: NSButton {
         isBordered = false
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override var intrinsicContentSize: NSSize { NSSize(width: 44, height: 24) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 34, height: 20) }
     override var state: NSControl.StateValue { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         let track = bounds.insetBy(dx: 1, dy: 1)
         let on = state == .on
-        let color: NSColor = on ? .systemBlue : .quaternaryLabelColor
+        let color: NSColor = on ? .controlAccentColor : .tertiaryLabelColor
         if isEnabled { color.setFill() } else { color.withAlphaComponent(0.4).setFill() }
         NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
         let size = track.height - 4
@@ -2281,22 +2371,22 @@ final class PrefSwitch: NSButton {
     }
 
     override func drawFocusRingMask() {
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 11, yRadius: 11).fill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 9, yRadius: 9).fill()
     }
     override var focusRingMaskBounds: NSRect { bounds }
 }
 
 /// Carte arrondie des préférences ; les couleurs suivent l'apparence (clair/sombre).
 final class PrefCard: NSView {
-    var fill: NSColor = .controlBackgroundColor
+    var fill: NSColor = NSColor.labelColor.withAlphaComponent(0.04)
     override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true }
     required init?(coder: NSCoder) { fatalError() }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
-        layer?.cornerRadius = 10; layer?.borderWidth = 1
+        layer?.cornerRadius = 8; layer?.borderWidth = 0.5
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = fill.cgColor
-            layer?.borderColor = NSColor.separatorColor.cgColor
+            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.6).cgColor
         }
     }
 }
@@ -2945,7 +3035,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              .foregroundColor: NSColor.tertiaryLabelColor]), indent: 14))
         }
         if !items.isEmpty { items.append(.separator()) }   // sinon double séparateur
-        let preferences = NSMenuItem(title: I18n.t("Preferences…", "Préférences…"), action: #selector(openPreferences), keyEquivalent: ",")
+        let preferences = NSMenuItem(title: I18n.t("Settings…", "Réglages…"), action: #selector(openPreferences), keyEquivalent: ",")
         preferences.target = self
         items.append(preferences)
 
@@ -2965,7 +3055,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var preferencesWindow: NSWindow?
     private var preferencesSettingsScroll: NSScrollView?
-    private var preferencesPreview: NSTextField?
+    fileprivate var preferencesTab = PrefTab.general
+    fileprivate var preferencesSidebar: NSTableView?
+    private var preferencesDetail: NSView?
+    private var previewMenuSize: (width: NSLayoutConstraint, height: NSLayoutConstraint)?
     private var desktopBarPreview: NSTextField?
     private var detailedPreviewScroll: NSScrollView?
     private var preferencesPreviewTimer: Timer?
@@ -2977,6 +3070,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let offset = scroll.contentView.bounds.origin
         let document = MenuPreviewDocument(items: menu.items)
         scroll.documentView = document
+        // Le menu simulé prend la largeur du vrai menu : jamais de défilement horizontal.
+        let scroller = NSScroller.preferredScrollerStyle == .legacy ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
+        previewMenuSize?.width.constant = document.frame.width + scroller
+        previewMenuSize?.height.constant = document.frame.height + 8
         scroll.contentView.scroll(to: NSPoint(x: offset.x,
             y: min(offset.y, max(0, document.frame.height - scroll.contentSize.height))))
         scroll.reflectScrolledClipView(scroll.contentView)
@@ -2984,7 +3081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updatePreferencesPreview() {
         guard let button = statusItem.button else { return }
-        for preview in [preferencesPreview, desktopBarPreview].compactMap({ $0 }) {
+        for preview in [desktopBarPreview].compactMap({ $0 }) {
             let rendered = NSMutableAttributedString(attributedString: button.attributedTitle)
             // Les symboles de la vraie barre peuvent être blancs sur un fond sombre.
             // Les résout pour l'apparence du bureau simulé, sans modifier les originaux.
@@ -3022,11 +3119,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let previewOffset = detailedPreviewScroll?.contentView.bounds.origin ?? .zero
         preferencesPreviewTimer?.invalidate()
         // Réutilise la fenêtre : traduire les réglages ne doit pas la fermer/rouvrir.
-        let window = preferencesWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 740),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = I18n.t("Agent Usage — Preferences", "Agent Usage — Préférences")
+        let window = preferencesWindow ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1080, height: 660),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        // En-tête d'app Mac : barre latérale pleine hauteur, titre + sous-titre de la section dans la barre d'outils.
+        window.title = PrefTab.title(preferencesTab)
+        window.subtitle = PrefTab.subtitle(preferencesTab)
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 980, height: 580)
+        window.minSize = NSSize(width: 940, height: 540)
+        if preferencesDetail == nil {
+            let toolbar = NSToolbar(identifier: "preferences")
+            toolbar.delegate = self; toolbar.displayMode = .iconOnly; toolbar.allowsUserCustomization = false
+            window.toolbar = toolbar
+            window.toolbarStyle = .unified
+            let split = NSSplitViewController()
+            let table = NSTableView()
+            table.style = .sourceList; table.headerView = nil; table.rowSizeStyle = .default
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("tab"))
+            column.resizingMask = .autoresizingMask
+            table.addTableColumn(column)
+            table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+            table.rowHeight = 28
+            table.dataSource = self; table.delegate = self
+            preferencesSidebar = table
+            let tableScroll = NSScrollView()
+            tableScroll.documentView = table; tableScroll.drawsBackground = false; tableScroll.hasVerticalScroller = false
+            let sidebarVC = NSViewController(); sidebarVC.view = tableScroll
+            let sidebar = NSSplitViewItem(sidebarWithViewController: sidebarVC)
+            sidebar.canCollapse = false; sidebar.minimumThickness = 190; sidebar.maximumThickness = 260
+            let detailVC = NSViewController(); detailVC.view = NSView()
+            split.addSplitViewItem(sidebar)
+            split.addSplitViewItem(NSSplitViewItem(viewController: detailVC))
+            window.contentViewController = split
+            window.setContentSize(NSSize(width: 1080, height: 660))
+            preferencesDetail = detailVC.view
+        }
+        preferencesSidebar?.reloadData()
+        if let row = PrefTab.all.firstIndex(of: preferencesTab) { preferencesSidebar?.selectRowIndexes([row], byExtendingSelection: false) }
         preferencesWindow = window
         let configs = AddedProviders.configs
         let content = NSView()
@@ -3045,17 +3173,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for v in views { v.widthAnchor.constraint(equalTo: s.widthAnchor, constant: -2 * inset).isActive = true }
             return s
         }
-        func card(_ title: String, _ hint: String?, _ rows: [NSView]) -> NSView {
-            var head: [NSView] = [text(title, weight: .semibold)]
-            if let hint = hint { head.append(text(hint, size: 11, color: .secondaryLabelColor)) }
-            let stack = vstack([vstack(head, spacing: 4)] + rows, spacing: 10, inset: 16)
+        func pad(_ view: NSView, h: CGFloat, v: CGFloat) -> NSView {
+            let s = NSStackView(views: [view])
+            s.orientation = .vertical; s.alignment = .leading
+            s.edgeInsets = NSEdgeInsets(top: v, left: h, bottom: v, right: h)
+            view.widthAnchor.constraint(equalTo: s.widthAnchor, constant: -2 * h).isActive = true
+            return s
+        }
+        // Groupe façon Réglages Système : titre au-dessus, lignes séparées par un filet, note en dessous.
+        func group(_ title: String?, footer: String? = nil, _ rows: [NSView], below: NSView? = nil) -> NSView {
+            var lines: [NSView] = []
+            for (i, r) in rows.enumerated() {
+                if i > 0 { let sep = NSBox(); sep.boxType = .separator; lines.append(pad(sep, h: 10, v: 0)) }
+                r.heightAnchor.constraint(greaterThanOrEqualToConstant: 22).isActive = true
+                lines.append(pad(r, h: 10, v: 7))
+            }
+            let stack = vstack(lines, spacing: 0)
             let box = PrefCard()
             stack.translatesAutoresizingMaskIntoConstraints = false
             box.addSubview(stack)
             NSLayoutConstraint.activate([
-                stack.topAnchor.constraint(equalTo: box.topAnchor), stack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+                stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 3), stack.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -3),
                 stack.leadingAnchor.constraint(equalTo: box.leadingAnchor), stack.trailingAnchor.constraint(equalTo: box.trailingAnchor)])
-            return box
+            var parts: [NSView] = (title.map { [pad(text($0, weight: .bold), h: 2, v: 0)] } ?? []) + [box]
+            if let footer = footer { parts.append(pad(text(footer, size: 11, color: .secondaryLabelColor), h: 2, v: 0)) }
+            if let below = below { parts.append(below) }
+            return vstack(parts, spacing: 6)
         }
         func providerLabel(_ title: String, id: String) -> NSTextField {
             let label = text(title)
@@ -3142,96 +3285,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return dock
         }
 
-        // Barre de menus
-        let preview = text("")
-        preview.alignment = .center
-        preferencesPreview = preview
-        let bar = MacDesktopPreview()
-        let simulatedBar = macMenuBar(preview, compact: false)
-        simulatedBar.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(simulatedBar)
-        NSLayoutConstraint.activate([
-            bar.heightAnchor.constraint(equalToConstant: 110),
-            simulatedBar.topAnchor.constraint(equalTo: bar.topAnchor),
-            simulatedBar.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
-            simulatedBar.trailingAnchor.constraint(equalTo: bar.trailingAnchor)])
-        updatePreferencesPreview()
+        // Général
+        // Ordre : fournisseurs intégrés, puis personnalisés, puis le cumul à part.
         let popup = NSPopUpButton()
-        for p in BarProvider.allCases {
-            popup.addItem(withTitle: p.menuTitle); popup.lastItem?.representedObject = p.rawValue
-            if p != .total { popup.lastItem?.image = ProviderIcons.image(p.rawValue, appearance: window.effectiveAppearance) }
+        func header(_ title: String) {
+            if #available(macOS 14, *) { popup.menu?.addItem(.sectionHeader(title: title)) }
+            else { popup.menu?.addItem(.separator()) }
         }
+        for p in BarProvider.allCases where p != .total {
+            popup.addItem(withTitle: p.menuTitle); popup.lastItem?.representedObject = p.rawValue
+            popup.lastItem?.image = ProviderIcons.image(p.rawValue, appearance: window.effectiveAppearance)
+        }
+        if !configs.isEmpty { header(I18n.t("Custom", "Personnalisés")) }
         for p in configs {
             popup.addItem(withTitle: p.name); popup.lastItem?.representedObject = "custom:" + p.id
             popup.lastItem?.image = ProviderIcons.image(p.openRouter ? "openrouter" : p.id, appearance: window.effectiveAppearance)
         }
+        header(I18n.t("All providers", "Tous fournisseurs"))
+        popup.addItem(withTitle: BarProvider.total.menuTitle); popup.lastItem?.representedObject = BarProvider.total.rawValue
+        popup.lastItem?.image = NSImage(systemSymbolName: "sum", accessibilityDescription: nil)
         let selected = UserDefaults.standard.string(forKey: "customBarProvider").map { "custom:" + $0 } ?? BarPref.current.rawValue
         if let item = popup.itemArray.first(where: { ($0.representedObject as? String) == selected }) { popup.select(item) }
         popup.target = self; popup.action = #selector(preferenceBarChanged(_:))
-        let barCard = card(I18n.t("Menu bar", "Barre de menus"), I18n.t("What the status item shows, live.", "Ce que l'icône affiche, en direct."),
-                           [bar, row(I18n.t("Indicator", "Indicateur"), popup, width: 230)])
-
-        // Menu détaillé
         let style = NSPopUpButton()
         for mode in DetailedMenuStyle.allCases {
             style.addItem(withTitle: mode.title); style.lastItem?.representedObject = mode.rawValue
         }
         style.selectItem(at: DetailedMenuStyle.allCases.firstIndex(of: DetailedMenuStyle.current) ?? 0)
         style.target = self; style.action = #selector(preferenceMenuStyleChanged(_:))
-
-        // Langue
         let langPopup = NSPopUpButton()
         for l in Lang.allCases {
             langPopup.addItem(withTitle: l.menuTitle); langPopup.lastItem?.representedObject = l.rawValue
         }
         langPopup.selectItem(withTitle: I18n.current.menuTitle)
         langPopup.target = self; langPopup.action = #selector(preferenceLanguageChanged(_:))
-        let menuCard = card(I18n.t("Menu display", "Affichage du menu"),
-                            I18n.t("Changes appear in the preview on the right.", "Les changements sont visibles dans l'aperçu à droite."), [
-            row(I18n.t("Layout", "Présentation"), style, width: 230),
-            row(I18n.t("Language", "Langue"), langPopup, width: 230),
+        let barGroup = group(I18n.t("Menu bar", "Barre de menus"), [
+            row(I18n.t("Indicator", "Indicateur"), popup, width: 200)])
+        let menuGroup = group(I18n.t("Menu", "Menu"), [
+            row(I18n.t("Layout", "Présentation"), style, width: 200),
+            row(I18n.t("Language", "Langue"), langPopup, width: 200),
             toggle(I18n.t("Cost by token type", "Coût par type de token"), id: "tokens",
                    on: TokenBreakdownPref.enabled, action: #selector(preferenceTokensChanged(_:)))])
 
-        // Sections
-        let sections = [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama"), ("local", I18n.t("Local models", "Modèles locaux")),
-                        ("switches", I18n.t("Model switches", "Bascules de modèles"))]
-        let sectionsCard = card(I18n.t("Visible sections", "Sections visibles"), I18n.t("Choose which providers appear in the menu.", "Choisis les fournisseurs à afficher dans le menu."),
-            sections.map { toggle($0.1, id: $0.0, on: ContentPref.visible($0.0), action: #selector(preferenceVisibilityChanged(_:))) })
-
-        // Fournisseurs
-        var providerRows: [NSView] = configs.map { p in
+        // Fournisseurs : intégrés et ajoutés dans une seule liste.
+        let builtIn = [("claude", "Claude"), ("codex", "Codex"), ("ollama", "Ollama"), ("local", I18n.t("Local models", "Modèles locaux")),
+                       ("switches", I18n.t("Model switches", "Bascules de modèles"))]
+        var providerRows: [NSView] = builtIn.map { toggle($0.1, id: $0.0, on: ContentPref.visible($0.0), action: #selector(preferenceVisibilityChanged(_:))) }
+        providerRows += configs.map { p in
             let name = providerLabel(p.name, id: p.openRouter ? "openrouter" : p.id)
             name.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-            let buttons: [NSView] = [(I18n.t("Edit…", "Modifier…"), #selector(preferenceEdit(_:))),
-                                     (I18n.t("Remove…", "Supprimer…"), #selector(preferenceRemove(_:)))].map { title, action in
-                let b = NSButton(title: title, target: self, action: action)
-                b.bezelStyle = .rounded; b.controlSize = .small
-                b.identifier = NSUserInterfaceItemIdentifier(p.id)
-                return b
+            let more = NSPopUpButton(frame: .zero, pullsDown: true)
+            more.isBordered = false
+            (more.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+            more.addItem(withTitle: "")
+            more.lastItem?.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: I18n.t("Actions", "Actions"))
+            for (title, action) in [(I18n.t("Edit…", "Modifier…"), #selector(editProvider(_:))),
+                                    (I18n.t("Remove…", "Supprimer…"), #selector(removeProvider(_:)))] {
+                more.addItem(withTitle: title)
+                more.lastItem?.target = self; more.lastItem?.action = action; more.lastItem?.representedObject = p.id
             }
             let sw = PrefSwitch()
             sw.setAccessibilityLabel(I18n.t("Show \(p.name)", "Afficher \(p.name)"))
             sw.state = ContentPref.visible(p.id) ? .on : .off
             sw.identifier = NSUserInterfaceItemIdentifier(p.id)
             sw.target = self; sw.action = #selector(preferenceVisibilityChanged(_:))
-            let s = NSStackView(views: [name] + buttons + [sw])
+            let s = NSStackView(views: [name, more, sw])
             s.orientation = .horizontal; s.alignment = .centerY; s.spacing = 8
             return s
         }
-        if providerRows.isEmpty {
-            providerRows = [text(I18n.t("None yet.", "Aucun pour l'instant."), size: 11, color: .secondaryLabelColor)]
-        }
-        let add = NSButton(title: I18n.t("+ Add a provider…", "+ Ajouter un fournisseur…"), target: self, action: #selector(addProvider))
-        let importKey = NSButton(title: I18n.t("Import OpenRouter", "Importer OpenRouter"), target: self, action: #selector(importOpenRouter))
-        for button in [add, importKey] { button.bezelStyle = .rounded; button.controlSize = .small }
-        importKey.toolTip = I18n.t("From environment / OpenCode", "Depuis l'environnement / OpenCode")
-        let actions = NSStackView(views: [add, importKey])
+        let add = NSButton(title: I18n.t("Add Provider…", "Ajouter un fournisseur…"), target: self, action: #selector(addProvider))
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        let actions = NSStackView(views: [spacer, add])
         actions.orientation = .horizontal; actions.spacing = 8
-        let providersCard = card(I18n.t("Additional providers", "Fournisseurs supplémentaires"),
-                                 I18n.t("Manage connections and their visibility in the menu.", "Gère les connexions et leur visibilité dans le menu."), providerRows + [actions])
+        let providersGroup = group(nil,
+                                   footer: I18n.t("Turned-off providers are hidden from the menu.", "Les fournisseurs désactivés sont masqués du menu."),
+                                   providerRows, below: actions)
 
-        let cards = vstack([barCard, menuCard, sectionsCard, providersCard], spacing: 12)
+        let cards = vstack(preferencesTab == PrefTab.providers ? [providersGroup] : [barGroup, menuGroup], spacing: 22)
         let document = FlippedView()
         cards.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(cards)
@@ -3245,21 +3376,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             document.topAnchor.constraint(equalTo: clip.topAnchor), document.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
             document.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
             cards.topAnchor.constraint(equalTo: document.topAnchor, constant: 20), cards.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -20),
-            cards.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 20), cards.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -20)])
+            cards.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24), cards.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -12)])
 
-        // Aperçu du menu détaillé
-        let heading = text(I18n.t("Preferences", "Préférences"), size: 22, weight: .bold)
-        let subtitle = text(I18n.t("Customize your menu bar and its detailed menu.", "Personnalise ta barre de menus et son menu détaillé."), size: 12, color: .secondaryLabelColor)
-        let previewTitle = text(I18n.t("Live preview", "Aperçu en direct"), size: 15, weight: .semibold)
-        let previewHint = text(I18n.t("Your menu, with current usage data.", "Ton menu, avec les données de consommation actuelles."), size: 11, color: .secondaryLabelColor)
-        let detailScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 360, height: 560))
-        detailScroll.autoresizingMask = [.width, .height]
+        // Aperçu : un bureau miniature, le menu déroulé sous l'indicateur, à sa taille réelle.
+        let previewTitle = text(I18n.t("Preview", "Aperçu"), weight: .bold)
+        let detailScroll = NSScrollView()
         detailScroll.hasVerticalScroller = true
-        detailScroll.hasHorizontalScroller = true
+        detailScroll.hasHorizontalScroller = false
         detailScroll.autohidesScrollers = true
         detailScroll.drawsBackground = false
         detailedPreviewScroll = detailScroll
-        let side = PrefCard()
         let desktop = MacDesktopPreview()
         let desktopIndicator = text("")
         desktopBarPreview = desktopIndicator
@@ -3271,37 +3397,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         detailScroll.translatesAutoresizingMaskIntoConstraints = false
         menuSurface.addSubview(detailScroll)
-        for v in [previewTitle, previewHint, desktop] { v.translatesAutoresizingMaskIntoConstraints = false; side.addSubview(v) }
         updatePreferencesPreview()
-        for v in [heading, subtitle] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        side.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(scroll); content.addSubview(side)
+        for v in [scroll, previewTitle, desktop] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
+        let menuWidth = menuSurface.widthAnchor.constraint(equalToConstant: 260)
+        let menuHeight = menuSurface.heightAnchor.constraint(equalToConstant: 300)
+        menuHeight.priority = .defaultHigh
+        previewMenuSize = (menuWidth, menuHeight)
         NSLayoutConstraint.activate([
-            heading.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
-            heading.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            subtitle.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 6),
-            subtitle.leadingAnchor.constraint(equalTo: heading.leadingAnchor),
-            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
-            scroll.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 4), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: side.leadingAnchor),
-            side.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 20), side.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            side.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20), side.widthAnchor.constraint(equalToConstant: 330),
-            previewTitle.topAnchor.constraint(equalTo: side.topAnchor, constant: 16),
-            previewTitle.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 16), previewTitle.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -16),
-            previewHint.topAnchor.constraint(equalTo: previewTitle.bottomAnchor, constant: 4),
-            previewHint.leadingAnchor.constraint(equalTo: previewTitle.leadingAnchor), previewHint.trailingAnchor.constraint(equalTo: previewTitle.trailingAnchor),
-            desktop.topAnchor.constraint(equalTo: previewHint.bottomAnchor, constant: 14),
-            desktop.bottomAnchor.constraint(equalTo: side.bottomAnchor, constant: -16),
-            desktop.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 16),
-            desktop.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -16),
+            scroll.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: desktop.leadingAnchor, constant: -12),
+            previewTitle.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor, constant: 20),
+            previewTitle.leadingAnchor.constraint(equalTo: desktop.leadingAnchor, constant: 2),
+            desktop.topAnchor.constraint(equalTo: previewTitle.bottomAnchor, constant: 6),
+            desktop.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            desktop.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            desktop.widthAnchor.constraint(equalTo: menuSurface.widthAnchor, constant: 40),
+            desktop.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
             desktopMenuBar.topAnchor.constraint(equalTo: desktop.topAnchor),
             desktopMenuBar.leadingAnchor.constraint(equalTo: desktop.leadingAnchor),
             desktopMenuBar.trailingAnchor.constraint(equalTo: desktop.trailingAnchor),
-            menuSurface.topAnchor.constraint(equalTo: desktopMenuBar.bottomAnchor, constant: 6),
-            menuSurface.trailingAnchor.constraint(equalTo: desktop.trailingAnchor, constant: -10),
-            menuSurface.leadingAnchor.constraint(equalTo: desktop.leadingAnchor, constant: 18),
-            menuSurface.bottomAnchor.constraint(equalTo: simulatedDock.topAnchor, constant: -12),
+            menuWidth, menuHeight,
+            menuSurface.topAnchor.constraint(equalTo: desktopMenuBar.bottomAnchor, constant: 4),
+            menuSurface.trailingAnchor.constraint(equalTo: desktop.trailingAnchor, constant: -20),
+            menuSurface.bottomAnchor.constraint(lessThanOrEqualTo: simulatedDock.topAnchor, constant: -12),
             detailScroll.topAnchor.constraint(equalTo: menuSurface.topAnchor, constant: 4),
             detailScroll.bottomAnchor.constraint(equalTo: menuSurface.bottomAnchor, constant: -4),
             detailScroll.leadingAnchor.constraint(equalTo: menuSurface.leadingAnchor),
@@ -3310,7 +3428,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             simulatedDock.bottomAnchor.constraint(equalTo: desktop.bottomAnchor, constant: -10)])
 
         // Remplace le contenu terminé en une fois, sans exposer une page vide.
-        window.contentView = content
+        if let detail = preferencesDetail {
+            detail.subviews.forEach { $0.removeFromSuperview() }
+            content.translatesAutoresizingMaskIntoConstraints = false
+            detail.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.topAnchor.constraint(equalTo: detail.topAnchor), content.bottomAnchor.constraint(equalTo: detail.bottomAnchor),
+                content.leadingAnchor.constraint(equalTo: detail.leadingAnchor), content.trailingAnchor.constraint(equalTo: detail.trailingAnchor)])
+        }
         if isNewWindow { window.center() }
         if !wasVisible {
             NSApp.activate(ignoringOtherApps: true)
@@ -3344,11 +3469,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         I18n.set(l)
         publishPreferences()
     }
-    @objc private func importOpenRouter() {
-        if let error = AddedProviders.importOpenRouter() { providerMessage(error); return }
-        refreshAddedProviders(force: true)
-        buildPreferences()
-    }
 
     private func publishPreferences() {
         let u = lastUsage ?? Usage()
@@ -3374,14 +3494,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             BarPref.set(p)
         }
         publishPreferences()
-    }
-    @objc private func preferenceEdit(_ sender: NSButton) {
-        let item = NSMenuItem(); item.representedObject = sender.identifier?.rawValue
-        editProvider(item)
-    }
-    @objc private func preferenceRemove(_ sender: NSButton) {
-        let item = NSMenuItem(); item.representedObject = sender.identifier?.rawValue
-        removeProvider(item)
     }
 
     private var addedRefreshAt: Date?
@@ -3423,17 +3535,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
 
+    private var pickedDetected: Int?
+
     @objc private func addProvider() {
-        let choice = NSAlert()
-        choice.messageText = I18n.t("Add a provider", "Ajouter un fournisseur")
-        choice.informativeText = I18n.t("OpenRouter is preconfigured. Other APIs need a JSON usage endpoint with Bearer authentication.", "OpenRouter est préconfiguré. Les autres API nécessitent un endpoint de consommation JSON avec authentification Bearer.")
-        choice.addButton(withTitle: "OpenRouter")
-        choice.addButton(withTitle: I18n.t("Custom API", "API personnalisée"))
-        choice.addButton(withTitle: I18n.t("Cancel", "Annuler"))
+        let found = AddedProviders.detect()
+        let alert = NSAlert()
+        alert.messageText = I18n.t("Add a provider", "Ajouter un fournisseur")
+        alert.informativeText = found.isEmpty
+            ? I18n.t("No provider found in OpenCode, Codex or the environment.", "Aucun fournisseur trouvé dans OpenCode, Codex ou l'environnement.")
+            : I18n.t("Found in your AI tools (OpenCode, Codex, environment).", "Trouvés dans tes outils IA (OpenCode, Codex, environnement).")
+        alert.addButton(withTitle: I18n.t("Custom API…", "API personnalisée…"))
+        alert.addButton(withTitle: I18n.t("Cancel", "Annuler"))
+        let rows: [NSView] = found.enumerated().map { index, d in
+            let icon = NSImageView()
+            switch d.kind {
+            case .builtIn(let section): icon.image = ProviderIcons.image(section.lowercased(), appearance: alert.window.effectiveAppearance)
+            case .openRouter: icon.image = ProviderIcons.image("openrouter", appearance: alert.window.effectiveAppearance)
+            case .added: icon.image = ProviderIcons.image(d.name.lowercased(), appearance: alert.window.effectiveAppearance)
+            case .custom: break
+            }
+            if icon.image == nil { icon.image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil) }
+            icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            let name = NSTextField(labelWithString: d.name)
+            name.font = .systemFont(ofSize: 13, weight: .medium); name.lineBreakMode = .byTruncatingTail
+            let detail = NSTextField(labelWithString: d.source)
+            detail.font = .systemFont(ofSize: 11); detail.textColor = .secondaryLabelColor
+            let labels = NSStackView(views: [name, detail]); labels.orientation = .vertical; labels.alignment = .leading; labels.spacing = 1
+            labels.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let trailing: NSView
+            func status(_ s: String) -> NSView {
+                let f = NSTextField(labelWithString: s); f.font = .systemFont(ofSize: 11); f.textColor = .secondaryLabelColor; return f
+            }
+            func button(_ title: String) -> NSView {
+                let b = NSButton(title: title, target: self, action: #selector(detectedProviderPicked(_:)))
+                b.bezelStyle = .rounded; b.controlSize = .small; b.tag = index
+                return b
+            }
+            switch d.kind {
+            case .builtIn(let section): trailing = status(I18n.t("Tracked: \(section)", "Suivi : \(section)"))
+            case .added: trailing = status(I18n.t("Already added", "Déjà ajouté"))
+            case .openRouter(let hasKey): trailing = button(hasKey ? I18n.t("Add", "Ajouter") : I18n.t("Set Up…", "Configurer…"))
+            case .custom: trailing = button(I18n.t("Set Up…", "Configurer…"))
+            }
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            let row = NSStackView(views: [icon, labels, spacer, trailing])
+            row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 8
+            return row
+        }
+        if !rows.isEmpty {
+            let list = NSStackView(views: rows)
+            list.orientation = .vertical; list.alignment = .leading; list.spacing = 8
+            for r in rows { r.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true }
+            list.widthAnchor.constraint(equalToConstant: 360).isActive = true
+            list.layoutSubtreeIfNeeded()
+            list.frame = NSRect(origin: .zero, size: NSSize(width: 360, height: list.fittingSize.height))
+            alert.accessoryView = list
+        }
+        pickedDetected = nil
         NSApp.activate(ignoringOtherApps: true)
-        let answer = choice.runModal()
-        guard answer != .alertThirdButtonReturn else { return }
-        showProviderEditor(nil, openRouter: answer == .alertFirstButtonReturn)
+        let answer = alert.runModal()
+        if answer == .alertFirstButtonReturn { showProviderEditor(nil, openRouter: false); return }
+        guard let index = pickedDetected, found.indices.contains(index) else { return }
+        let d = found[index]
+        if case .openRouter(let hasKey) = d.kind {
+            if hasKey, AddedProviders.importOpenRouter() == nil {
+                refreshAddedProviders(force: true)
+                if preferencesWindow?.isVisible == true { buildPreferences() }
+            } else { showProviderEditor(nil, openRouter: true) }
+        } else {
+            showProviderEditor(nil, openRouter: false, name: d.name)
+        }
+    }
+
+    @objc private func detectedProviderPicked(_ sender: NSButton) {
+        pickedDetected = sender.tag
+        NSApp.stopModal(withCode: NSApplication.ModalResponse(rawValue: 2000))
     }
 
     @objc private func editProvider(_ sender: NSMenuItem) {
@@ -3467,7 +3645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         WidgetFeed.publish(usage, updated: lastUpdate ?? Date())
     }
 
-    private func showProviderEditor(_ existing: AddedProvider?, openRouter: Bool) {
+    private func showProviderEditor(_ existing: AddedProvider?, openRouter: Bool, name prefill: String = "") {
         let alert = NSAlert()
         alert.messageText = existing == nil ? I18n.t("Add provider", "Ajouter un fournisseur") : I18n.t("Edit provider", "Modifier le fournisseur")
         alert.informativeText = openRouter
@@ -3492,7 +3670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             y -= 2
             return input
         }
-        let name = field(I18n.t("Name", "Nom"), value: existing?.name ?? (openRouter ? "OpenRouter" : ""))
+        let name = field(I18n.t("Name", "Nom"), value: existing?.name ?? (openRouter ? "OpenRouter" : prefill))
         let url = field(I18n.t("Usage API URL", "URL de l'API de consommation"), value: existing?.url ?? (openRouter ? "https://openrouter.ai/api/v1/key" : ""), placeholder: "https://…/usage")
         if openRouter { url.isEditable = false; url.isSelectable = true }
         let key = field(I18n.t("API key (stored in Keychain)", "Clé API (conservée dans le Trousseau)"), value: "", placeholder: existing == nil ? "sk-…" : I18n.t("Leave empty to keep the current key", "Laisser vide pour conserver la clé"), secure: true)
@@ -4191,6 +4369,57 @@ if CommandLine.arguments.contains("--import-openrouter") {
     if let error = AddedProviders.importOpenRouter() { print(error); exit(1) }
     print("OpenRouter imported into Keychain.")
     exit(0)
+}
+
+enum PrefTab {
+    static let general = NSToolbarItem.Identifier("general")
+    static let providers = NSToolbarItem.Identifier("providers")
+    static let all = [general, providers]
+    static func title(_ id: NSToolbarItem.Identifier) -> String {
+        id == providers ? I18n.t("Providers", "Fournisseurs") : I18n.t("General", "Général")
+    }
+    static func subtitle(_ id: NSToolbarItem.Identifier) -> String {
+        id == providers ? I18n.t("What appears in the menu", "Ce qui apparaît dans le menu")
+                        : I18n.t("Menu bar and detailed menu", "Barre de menus et menu détaillé")
+    }
+    static func symbol(_ id: NSToolbarItem.Identifier) -> String { id == providers ? "square.stack.3d.up" : "gearshape" }
+    static let add = NSToolbarItem.Identifier("addProvider")
+}
+
+extension AppDelegate: NSToolbarDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.sidebarTrackingSeparator, .flexibleSpace, PrefTab.add] }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
+                 willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        guard id == PrefTab.add else { return nil }
+        let item = NSToolbarItem(itemIdentifier: id)
+        item.label = I18n.t("Add Provider", "Ajouter un fournisseur"); item.toolTip = item.label
+        item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: item.label)
+        item.isBordered = true
+        item.target = self; item.action = #selector(addProvider)
+        return item
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { PrefTab.all.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = PrefTab.all[row]
+        let cell = NSTableCellView()
+        let icon = NSImageView(image: NSImage(systemSymbolName: PrefTab.symbol(id), accessibilityDescription: nil) ?? NSImage())
+        let label = NSTextField(labelWithString: PrefTab.title(id))
+        cell.imageView = icon; cell.textField = label
+        let stack = NSStackView(views: [icon, label])
+        stack.spacing = 6; stack.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(stack)
+        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                                     stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+        return cell
+    }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard let row = preferencesSidebar?.selectedRow, PrefTab.all.indices.contains(row),
+              PrefTab.all[row] != preferencesTab else { return }
+        preferencesTab = PrefTab.all[row]
+        buildPreferences()
+    }
 }
 
 // `--once` : vrai appel à l'API, imprime le résultat et quitte.

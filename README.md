@@ -79,11 +79,11 @@ eyes without clicking:
 | **Claude** (default) | `⌛70% 🗓20% $436` — Claude's 5h + weekly, and Claude's cost |
 | **Codex** | `🗓78% $0.75` — Codex's weekly, and Codex's cost |
 | **Ollama** | `⚡100% 🗓73%` — Ollama's session + weekly, and **no cost**: its API only reports a 4-week figure, which would clash with the daily numbers everywhere else |
-| **Total cost** | `$437` — the combined spend, nothing else |
+| **Today's total cost** | `$437` — the combined spend, nothing else |
 
 The cost always follows the same choice, so the whole bar talks about one thing.
 
-**Total cost** shows money only, on purpose: dollars add up across providers, percentages don't
+**Today's total cost** shows money only, on purpose: dollars add up across providers, percentages don't
 (70% left of Claude's weekly and 78% of Codex's are two unrelated resources — a sum or an average
 of them would be a made-up number). The percentages stay one click away in the dropdown.
 
@@ -296,7 +296,7 @@ The whole interface is available in **English (default)** and **French**. Switch
 
 ## Preferences and additional providers
 
-Open **Preferences…** from the menu-bar app for a live indicator preview and an always-visible
+Open **Settings…** from the menu-bar app for a live indicator preview and an always-visible
 detailed menu preview beside the settings (no click needed). Choose its indicator, show/hide
 provider sections in the menu/widget, and toggle the token cost breakdown.
 **Add a provider… → OpenRouter** only needs a name and a standard API key; its
