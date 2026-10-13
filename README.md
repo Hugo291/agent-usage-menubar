@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="AppIcon.svg" width="128" alt="Agent Usage">
+</p>
+
 # Agent Usage — Claude, Codex and Ollama in your menu bar (macOS)
 
 A tiny native macOS menu-bar widget that shows **what you have left** across
